@@ -18,6 +18,9 @@ def emit(payload: dict) -> None:
 def run_ffmpeg_normalize(input_path: Path, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if input_path.resolve() == output_path.resolve():
+        return
+
     command = [
         "ffmpeg",
         "-y",
@@ -271,14 +274,30 @@ def compute_analysis(normalized_path: Path) -> dict:
     }
 
 
-def write_analysis_report(analysis_path: Path, payload: dict, analysis: dict) -> None:
+def write_analysis_report(
+    analysis_path: Path,
+    project_id: str,
+    analysis: dict,
+    run_id: str | None = None,
+) -> None:
     analysis_report = {
-        "project_id": payload["project_id"],
-        "run_id": payload["run_id"],
+        "project_id": project_id,
+        "run_id": run_id,
         **analysis,
     }
     analysis_path.parent.mkdir(parents=True, exist_ok=True)
     analysis_path.write_text(json.dumps(analysis_report, indent=2), encoding="utf-8")
+
+
+def load_analysis_report(analysis_path: Path) -> dict:
+    return json.loads(analysis_path.read_text(encoding="utf-8"))
+
+
+def analyze_project(input_path: Path, normalized_path: Path, analysis_path: Path, project_id: str) -> int:
+    run_ffmpeg_normalize(input_path, normalized_path)
+    analysis = compute_analysis(normalized_path)
+    write_analysis_report(analysis_path, project_id, analysis)
+    return 0
 
 
 def build_filter_chain(analysis: dict) -> str:
@@ -516,6 +535,7 @@ def run(payload_path: Path) -> int:
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     run_id = payload["run_id"]
     input_path = Path(payload["input_path"])
+    analysis_report_path = payload.get("analysis_report_path")
     run_dir = payload_path.parent
     project_dir = run_dir.parent.parent
     normalized_path = project_dir / "source" / "normalized.wav"
@@ -532,12 +552,16 @@ def run(payload_path: Path) -> int:
 
     steps = [
         ("normalize", "Preparing and normalizing audio"),
-        ("analyze", "Inspecting the track for common AI artifacts"),
         ("separate_stems", "Separating vocals and backing stems with Demucs"),
         ("repair_vocals", "Applying targeted cleanup to the vocal stem"),
         ("repair_music", "Applying targeted cleanup to the music stem"),
         ("reconstruct_mix", "Rebuilding the cleaned mix and exports"),
     ]
+
+    if analysis_report_path:
+        analysis = load_analysis_report(Path(analysis_report_path))
+    elif analysis_path.exists():
+        analysis = load_analysis_report(analysis_path)
 
     for index, (step, message) in enumerate(steps, start=1):
         emit(
@@ -552,9 +576,6 @@ def run(payload_path: Path) -> int:
 
         if step == "normalize":
             run_ffmpeg_normalize(input_path, normalized_path)
-        elif step == "analyze":
-            analysis = compute_analysis(normalized_path)
-            write_analysis_report(analysis_path, payload, analysis)
         elif step == "separate_stems":
             split_stems(
                 normalized_path,
@@ -593,7 +614,7 @@ def run(payload_path: Path) -> int:
         time.sleep(0.05)
 
     if analysis is None:
-        raise RuntimeError("Analysis was not generated")
+        raise RuntimeError("Analysis is required before cleanup. Run project analysis first.")
 
     write_report(
         report_path,
@@ -653,7 +674,21 @@ def parse_reexport_argv() -> tuple[Path, Path, str]:
     return args.preview, args.export_path, args.format
 
 
+def parse_analyze_argv() -> tuple[Path, Path, Path, str]:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--analyze-input", type=Path, required=True)
+    parser.add_argument("--normalized-output", type=Path, required=True)
+    parser.add_argument("--analysis-report", type=Path, required=True)
+    parser.add_argument("--project-id", type=str, required=True)
+    args = parser.parse_args()
+    return args.analyze_input, args.normalized_output, args.analysis_report, args.project_id
+
+
 if __name__ == "__main__":
+    if "--analyze-input" in sys.argv:
+        input_path, normalized_path, analysis_path, project_id = parse_analyze_argv()
+        raise SystemExit(analyze_project(input_path, normalized_path, analysis_path, project_id))
+
     if "--reexport" in sys.argv:
         preview, export_path, fmt = parse_reexport_argv()
         reexport(preview, export_path, fmt)

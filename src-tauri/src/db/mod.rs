@@ -476,6 +476,67 @@ impl Database {
         })
     }
 
+    pub fn store_analysis_report(
+        &self,
+        project_id: &str,
+        analysis_report_path: &str,
+        normalized_path: &str,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        let now = Utc::now().to_rfc3339();
+
+        let analysis_json = std::fs::read_to_string(analysis_report_path)?;
+        let analysis_value = serde_json::from_str::<serde_json::Value>(&analysis_json)?;
+        let recommended_preset = analysis_value
+            .get("recommended_preset")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ai_song_cleanup");
+        let runtime_estimate_sec = analysis_value
+            .get("runtime_estimate_sec")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(45);
+
+        connection.execute(
+            "UPDATE source_files SET normalized_path = ?1 WHERE project_id = ?2",
+            params![normalized_path, project_id],
+        )?;
+
+        connection.execute(
+            "DELETE FROM analysis_reports WHERE project_id = ?1",
+            params![project_id],
+        )?;
+
+        connection.execute(
+            "INSERT INTO analysis_reports (id, project_id, report_path, recommended_preset, runtime_estimate_sec, summary_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                project_id,
+                analysis_report_path,
+                recommended_preset,
+                runtime_estimate_sec,
+                analysis_json,
+                now,
+            ],
+        )?;
+
+        connection.execute(
+            "DELETE FROM assets WHERE project_id = ?1 AND run_id IS NULL AND kind = 'normalized_audio'",
+            params![project_id],
+        )?;
+
+        connection.execute(
+            "INSERT INTO assets (id, project_id, run_id, kind, path, metadata_json) VALUES (?1, ?2, NULL, ?3, ?4, NULL)",
+            params![Uuid::new_v4().to_string(), project_id, "normalized_audio", normalized_path],
+        )?;
+
+        connection.execute(
+            "UPDATE projects SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params!["analyzed", now, project_id],
+        )?;
+
+        Ok(())
+    }
+
     pub fn get_latest_run(&self, project_id: &str) -> Result<Option<RunSummary>> {
         let connection = self.connection()?;
         connection

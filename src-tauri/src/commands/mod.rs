@@ -83,6 +83,17 @@ pub struct StartRunRequest {
     pub gpu_enabled: bool,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct AnalyzeProjectRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnalyzeProjectResult {
+    pub analysis_report_path: String,
+    pub normalized_path: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunProgressPayload {
     pub run_id: String,
@@ -200,6 +211,66 @@ pub async fn open_source_file_dialog(app: tauri::AppHandle) -> Result<FileDialog
 }
 
 #[tauri::command]
+pub fn analyze_project(
+    request: AnalyzeProjectRequest,
+    state: State<'_, AppState>,
+) -> Result<AnalyzeProjectResult, String> {
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| "Failed to lock settings state".to_string())?
+        .clone();
+
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| "Failed to lock database state".to_string())?
+        .clone();
+
+    let project = database
+        .get_project_detail(&request.project_id)
+        .map_err(|error| error.to_string())?;
+
+    let project_dir = settings.storage_dir.join("projects").join(&request.project_id);
+    let normalized_path = project_dir.join("source").join("normalized.wav");
+    let analysis_report_path = project_dir.join("analysis").join("analysis-report.json");
+
+    let output = Command::new(&settings.python_command)
+        .arg(&settings.engine_entry)
+        .arg("--analyze-input")
+        .arg(&project.source_file.original_path)
+        .arg("--normalized-output")
+        .arg(&normalized_path)
+        .arg("--analysis-report")
+        .arg(&analysis_report_path)
+        .arg("--project-id")
+        .arg(&request.project_id)
+        .output()
+        .map_err(|error| format!("Failed to run analysis: {}", error))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Analysis failed: {}", stderr.trim()));
+    }
+
+    let analysis_report_path_str = analysis_report_path.display().to_string();
+    let normalized_path_str = normalized_path.display().to_string();
+
+    database
+        .store_analysis_report(
+            &request.project_id,
+            &analysis_report_path_str,
+            &normalized_path_str,
+        )
+        .map_err(|error| error.to_string())?;
+
+    Ok(AnalyzeProjectResult {
+        analysis_report_path: analysis_report_path_str,
+        normalized_path: normalized_path_str,
+    })
+}
+
+#[tauri::command]
 pub fn start_project_run(
     request: StartRunRequest,
     app: tauri::AppHandle,
@@ -241,15 +312,19 @@ pub fn start_project_run(
         .get_project_detail(&request.project_id)
         .map_err(|error| error.to_string())?;
 
-    let input_path = project
-        .source_file
-        .normalized_path
-        .unwrap_or(project.source_file.original_path);
+    let analysis_report_path = project
+        .analysis_report
+        .as_ref()
+        .map(|report| report.report_path.clone())
+        .ok_or_else(|| "Run analysis first before starting cleanup.".to_string())?;
+
+    let input_path = project.source_file.original_path;
 
     let payload = RunPayload {
         project_id: request.project_id,
         run_id: created_run.run.id.clone(),
         input_path,
+        analysis_report_path: Some(analysis_report_path),
         preset: request.preset,
         options: RunOptions {
             intensity: request.intensity,
@@ -297,6 +372,12 @@ pub fn start_project_run(
         let final_status = if result.is_ok() { "completed" } else { "failed" };
         let final_message = result.as_ref().err().map(|error| error.to_string());
 
+        if let Some(state) = app_handle.try_state::<AppState>() {
+            if let Ok(mut jobs) = state.jobs.lock() {
+                jobs.clear_if_matches(&run_id);
+            }
+        }
+
         let _ = app_handle.emit(
             "run-status",
             RunProgressPayload {
@@ -305,12 +386,6 @@ pub fn start_project_run(
                 message: final_message,
             },
         );
-
-        if let Some(state) = app_handle.try_state::<AppState>() {
-            if let Ok(mut jobs) = state.jobs.lock() {
-                jobs.clear_if_matches(&run_id);
-            }
-        }
     });
 
     Ok(RunLaunchResult {

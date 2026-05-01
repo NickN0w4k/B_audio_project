@@ -135,9 +135,14 @@ type ExportResult = {
   format: string
 }
 
-type Screen = 'Home' | 'Analysis' | 'Repair' | 'Processing' | 'Compare' | 'Export'
+type AnalyzeProjectResult = {
+  analysis_report_path: string
+  normalized_path: string
+}
 
-const NAV_STEPS: Screen[] = ['Home', 'Analysis', 'Repair', 'Processing', 'Compare', 'Export']
+type Screen = 'Home' | 'Analysis' | 'Repair' | 'Compare' | 'Export'
+
+const NAV_STEPS: Screen[] = ['Home', 'Analysis', 'Repair', 'Compare', 'Export']
 
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (!isTauri()) {
@@ -180,6 +185,7 @@ export function App() {
   const [sourcePath, setSourcePath] = useState('')
   const [isLoading, setIsLoading] = useState(true)
   const [isImporting, setIsImporting] = useState(false)
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [isRunning, setIsRunning] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -219,12 +225,17 @@ export function App() {
   const runtimeDetail = status?.cuda_available
     ? (status.gpu_name ?? 'CUDA device detected')
     : 'CUDA not available'
+  const hasActiveRun = Boolean(status?.active_run_id)
+  const isBusy = isAnalyzing || Boolean(status?.active_run_id)
+  const overlayTitle = isAnalyzing ? 'Analyzing Track' : 'Processing Cleanup'
+  const overlayDescription = isAnalyzing
+    ? 'Inspecting the song and generating a reusable issue report.'
+    : 'Running the cleanup pipeline on the current project.'
 
   // Auto-advance screen based on run state
   const autoScreen = useMemo<Screen>(() => {
     if (!selectedProject) return 'Home'
-    if (isRunning || selectedRun?.run.status === 'running') return 'Processing'
-    if (selectedRun?.run.status === 'completed') return 'Compare'
+    if (selectedRun?.run.status === 'completed' && isRunning) return 'Compare'
     if (selectedProject.analysis_report) return 'Analysis'
     return 'Home'
   }, [isRunning, selectedProject, selectedRun])
@@ -304,11 +315,17 @@ export function App() {
       unsubStatus = await listen<RunStatusEvent>('run-status', async (event) => {
         setMessage(`Run ${event.payload.run_id} ${event.payload.status}.`)
         setIsRunning(event.payload.status === 'running')
+        if (event.payload.status !== 'running') {
+          setLiveStep(null)
+        }
         if (event.payload.status === 'failed') {
           setError(
             event.payload.message ??
               `Run ${event.payload.run_id} failed. Check the latest run details and try again.`,
           )
+        }
+        if (event.payload.status === 'completed') {
+          setScreen('Compare')
         }
         await refreshStatus()
         if (selectedProjectIdRef.current) await refreshProjects(selectedProjectIdRef.current)
@@ -317,7 +334,6 @@ export function App() {
         } catch {
           // ignore transient failures while run record settles
         }
-        if (event.payload.status !== 'running') setLiveStep(null)
       })
 
       unsubStep = await listen<RunStepEvent>('run-step', async (event) => {
@@ -385,7 +401,7 @@ export function App() {
       })
       setSourcePath('')
       setMessage(`Imported: ${result.project.project.name}`)
-      await refreshProjects(result.project.project.id)
+      await runProjectAnalysis(result.project.project.id, true)
       await refreshStatus()
       setScreen('Analysis')
     } catch (e) {
@@ -399,8 +415,8 @@ export function App() {
     setError(null)
     setMessage(null)
     try {
-      await loadProject(projectId)
-      setScreen('Analysis')
+      const project = await loadProject(projectId)
+      setScreen(project?.analysis_report ? 'Analysis' : 'Repair')
     } catch (e) {
       setError((e as Error).message)
     }
@@ -409,6 +425,10 @@ export function App() {
   async function startRun() {
     if (!selectedProject) {
       setError('Import or select a project first.')
+      return
+    }
+    if (!selectedProject.analysis_report) {
+      setError('Run analysis first before starting cleanup.')
       return
     }
     const request: StartRunRequest = {
@@ -422,7 +442,6 @@ export function App() {
     setIsRunning(true)
     setError(null)
     setMessage('Starting cleanup run...')
-    setScreen('Processing')
     try {
       const result = await invoke<{ run_id: string; status: string }>('start_project_run', {
         request,
@@ -455,6 +474,24 @@ export function App() {
       setError((e as Error).message)
     } finally {
       setIsExporting(false)
+    }
+  }
+
+  async function runProjectAnalysis(projectId: string, silentMessage = false) {
+    setIsAnalyzing(true)
+    setError(null)
+    if (!silentMessage) setMessage('Running analysis...')
+    try {
+      await invoke<AnalyzeProjectResult>('analyze_project', {
+        request: { project_id: projectId },
+      })
+      await refreshProjects(projectId)
+      if (!silentMessage) setMessage('Analysis complete.')
+      setScreen('Analysis')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setIsAnalyzing(false)
     }
   }
 
@@ -537,13 +574,24 @@ export function App() {
         <div className="panel-header-row">
           <h3>Analysis Report</h3>
           {selectedProject ? (
-            <button
-              type="button"
-              onClick={() => setScreen('Repair')}
-              disabled={!selectedProject.analysis_report}
-            >
-              Continue to Repair Setup
-            </button>
+            <div>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => void runProjectAnalysis(selectedProject.project.id)}
+                disabled={isAnalyzing || isRunning}
+              >
+                {isAnalyzing ? 'Analyzing...' : 'Re-run Analysis'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setScreen('Repair')}
+                disabled={!selectedProject.analysis_report}
+                style={{ marginLeft: '0.75rem' }}
+              >
+                Continue to Repair Setup
+              </button>
+            </div>
           ) : null}
         </div>
 
@@ -573,17 +621,16 @@ export function App() {
             </div>
           </>
         ) : (
-          <p>
-            No analysis report yet. Start a cleanup run from the Repair screen to generate one.
-            <br />
+          <div>
+            <p>No analysis report yet.</p>
             <button
               type="button"
-              style={{ marginTop: '1rem' }}
-              onClick={() => setScreen('Repair')}
+              onClick={() => void runProjectAnalysis(selectedProject.project.id)}
+              disabled={isAnalyzing || isRunning}
             >
-              Go to Repair Setup
+              {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
             </button>
-          </p>
+          </div>
         )}
       </section>
     )
@@ -597,9 +644,9 @@ export function App() {
           <button
             type="button"
             onClick={() => void startRun()}
-            disabled={!selectedProject || isRunning}
+            disabled={!selectedProject || !selectedProject.analysis_report || hasActiveRun || isAnalyzing}
           >
-            {isRunning ? 'Running...' : 'Start AI Song Cleanup'}
+            {hasActiveRun ? 'Running...' : 'Start AI Song Cleanup'}
           </button>
         </div>
 
@@ -668,76 +715,78 @@ export function App() {
                   </div>
                 ))}
               </article>
-            ) : null}
+            ) : (
+              <article className="setup-card">
+                <h4>Analysis Required</h4>
+                <p className="meta-text">
+                  Run analysis first to detect issues and unlock cleanup settings based on the report.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void runProjectAnalysis(selectedProject.project.id)}
+                  disabled={isAnalyzing || isRunning}
+                >
+                  {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
+                </button>
+              </article>
+            )}
           </div>
         )}
       </section>
     )
   }
 
-  function screenProcessing() {
+  function renderProgressOverlay() {
+    if (!isBusy) return null
+
     const overallProgress = liveStep ? Math.round(liveStep.progress * 100) : 0
 
     return (
-      <section className="panel screen-panel">
-        <h3>Processing</h3>
-
-        {isRunning || selectedRun?.run.status === 'running' ? (
-          <>
-            <div className="progress-bar-track">
-              <div className="progress-bar-fill" style={{ width: `${overallProgress}%` }} />
+      <div className="progress-overlay-backdrop" role="status" aria-live="polite">
+        <div className="progress-overlay-card">
+          <div className="panel-header-row">
+            <div>
+              <h3>{overlayTitle}</h3>
+              <p className="meta-text">{overlayDescription}</p>
             </div>
-            <p className="meta-text progress-label">
-              {liveStep
-                ? `${formatStepLabel(liveStep.step_name)} · ${overallProgress}%`
-                : 'Starting…'}
-            </p>
-            {liveStep ? (
-              <p className="meta-text">{liveStep.message}</p>
-            ) : null}
-          </>
-        ) : selectedRun?.run.status === 'completed' ? (
-          <div className="banner success" style={{ marginBottom: '1rem' }}>
-            Run completed.{' '}
-            <button
-              type="button"
-              className="ghost-button inline-button"
-              onClick={() => setScreen('Compare')}
-            >
-              Go to Compare
-            </button>
+            <span className="runtime-pill runtime-pill-gpu">
+              {isAnalyzing ? 'Analysis' : 'Cleanup'}
+            </span>
           </div>
-        ) : selectedRun?.run.status === 'failed' ? (
-          <div className="banner error" style={{ marginBottom: '1rem' }}>
-            {selectedRun.run.failure_message ?? 'Run failed before producing a report.'}
-            <div style={{ marginTop: '0.75rem' }}>
-              <button type="button" onClick={() => void startRun()} disabled={isRunning}>
-                Retry Cleanup
-              </button>
-            </div>
-          </div>
-        ) : (
-          <p className="meta-text">No active run. Go to Repair Setup and start a run.</p>
-        )}
 
-        {selectedRun?.steps.length ? (
-          <ul className="status-list stacked run-steps" style={{ marginTop: '1.5rem' }}>
-            {selectedRun.steps.map((step) => (
-              <li key={step.id}>
-                <div>
-                  <strong>{formatStepLabel(step.step_name)}</strong>
-                  {liveStep &&
-                  liveStep.run_id === step.run_id &&
-                  liveStep.step_name === step.step_name ? (
-                    <div className="meta-text">{liveStep.message}</div>
-                  ) : null}
-                </div>
-                <span className="step-status">{step.status}</span>
-              </li>
-            ))}
-          </ul>
-        ) : null}
-      </section>
+          <div className="progress-bar-track">
+            <div className="progress-bar-fill" style={{ width: `${overallProgress}%` }} />
+          </div>
+
+          <p className="meta-text progress-label">
+            {liveStep ? `${formatStepLabel(liveStep.step_name)} · ${overallProgress}%` : 'Working...'}
+          </p>
+
+          <p className="meta-text">
+            {isAnalyzing
+              ? 'Preparing normalized audio and updating the issue report.'
+              : liveStep?.message ?? 'Starting cleanup pipeline...'}
+          </p>
+
+          {!isAnalyzing && selectedRun?.steps.length ? (
+            <ul className="status-list stacked run-steps progress-overlay-steps">
+              {selectedRun.steps.map((step) => (
+                <li key={step.id}>
+                  <div>
+                    <strong>{formatStepLabel(step.step_name)}</strong>
+                    {liveStep &&
+                    liveStep.run_id === step.run_id &&
+                    liveStep.step_name === step.step_name ? (
+                      <div className="meta-text">{liveStep.message}</div>
+                    ) : null}
+                  </div>
+                  <span className="step-status">{step.status}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      </div>
     )
   }
 
@@ -914,7 +963,6 @@ export function App() {
       case 'Home': return screenHome()
       case 'Analysis': return screenAnalysis()
       case 'Repair': return screenRepair()
-      case 'Processing': return screenProcessing()
       case 'Compare': return screenCompare()
       case 'Export': return screenExport()
     }
@@ -962,6 +1010,7 @@ export function App() {
         {message ? <div className="banner success">{message}</div> : null}
 
         {renderScreen()}
+        {renderProgressOverlay()}
       </main>
     </div>
   )

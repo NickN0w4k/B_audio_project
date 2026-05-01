@@ -21,6 +21,7 @@ pub struct RunPayload {
     pub project_id: String,
     pub run_id: String,
     pub input_path: String,
+    pub analysis_report_path: Option<String>,
     pub preset: String,
     pub options: RunOptions,
 }

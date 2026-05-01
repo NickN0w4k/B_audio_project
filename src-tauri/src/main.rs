@@ -6,7 +6,7 @@ mod models;
 mod settings;
 
 use commands::{
-    export_audio, get_app_status, get_project, get_run, import_project, init_app,
+    analyze_project, export_audio, get_app_status, get_project, get_run, import_project, init_app,
     list_projects, open_source_file_dialog, start_project_run,
 };
 use db::Database;
@@ -46,6 +46,7 @@ fn main() {
             get_project,
             get_run,
             open_source_file_dialog,
+            analyze_project,
             start_project_run,
             export_audio
         ])
