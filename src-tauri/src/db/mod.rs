@@ -49,6 +49,9 @@ pub struct AnalysisIssue {
     pub severity: String,
     pub confidence: Option<f64>,
     pub description: String,
+    pub artifact_title: Option<String>,
+    pub detection: Option<String>,
+    pub repair: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +60,8 @@ pub struct AnalysisReportRecord {
     pub project_id: String,
     pub report_path: String,
     pub recommended_preset: Option<String>,
+    pub suggested_intensity: Option<String>,
+    pub planned_repair_modules: Vec<String>,
     pub runtime_estimate_sec: Option<i64>,
     pub overall_confidence: Option<f64>,
     pub estimated_cutoff_hz: Option<f64>,
@@ -428,6 +433,13 @@ impl Database {
                         project_id: row.get(1)?,
                         report_path: row.get(2)?,
                         recommended_preset: row.get(3)?,
+                        suggested_intensity: summary_json
+                            .as_deref()
+                            .and_then(parse_suggested_intensity_from_summary),
+                        planned_repair_modules: summary_json
+                            .as_deref()
+                            .and_then(parse_planned_repair_modules_from_summary)
+                            .unwrap_or_default(),
                         runtime_estimate_sec: row.get(4)?,
                         overall_confidence: summary_json
                             .as_deref()
@@ -926,6 +938,18 @@ fn parse_issues_from_summary(summary_json: &str) -> Option<Vec<AnalysisIssue>> {
                     severity: issue.get("severity")?.as_str()?.to_string(),
                     confidence: issue.get("confidence").and_then(serde_json::Value::as_f64),
                     description: issue.get("description")?.as_str()?.to_string(),
+                    artifact_title: issue
+                        .get("artifact_title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string),
+                    detection: issue
+                        .get("detection")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string),
+                    repair: issue
+                        .get("repair")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string),
                 })
             })
             .collect(),
@@ -945,4 +969,24 @@ fn parse_estimated_cutoff_from_summary(summary_json: &str) -> Option<f64> {
 fn parse_spectrogram_path_from_summary(summary_json: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
     value.get("spectrogram_path")?.as_str().map(ToString::to_string)
+}
+
+fn parse_suggested_intensity_from_summary(summary_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
+    value
+        .get("suggested_intensity")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+fn parse_planned_repair_modules_from_summary(summary_json: &str) -> Option<Vec<String>> {
+    let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
+    let modules = value.get("planned_repair_modules")?.as_array()?;
+
+    Some(
+        modules
+            .iter()
+            .filter_map(|module| module.as_str().map(ToString::to_string))
+            .collect(),
+    )
 }

@@ -107,6 +107,8 @@ type ProjectDetail = {
     project_id: string
     report_path: string
     recommended_preset?: string | null
+    suggested_intensity?: string | null
+    planned_repair_modules: string[]
     runtime_estimate_sec?: number | null
     overall_confidence?: number | null
     estimated_cutoff_hz?: number | null
@@ -119,6 +121,9 @@ type ProjectDetail = {
       severity: string
       confidence?: number | null
       description: string
+      artifact_title?: string | null
+      detection?: string | null
+      repair?: string | null
     }>
   } | null
   latest_run?: RunSummary | null
@@ -198,49 +203,6 @@ function intensityDescription(intensity: 'light' | 'medium' | 'strong'): string 
   }
 }
 
-function getRepairModules(report?: ProjectDetail['analysis_report'] | null): string[] {
-  if (!report) return []
-
-  const issueIds = new Set(report.issues.map((issue) => issue.id))
-  const modules: string[] = []
-
-  if (issueIds.has('robotic_vocals')) {
-    modules.push('Vocal humanization EQ: softens static presence and upper vocal artifacts')
-  }
-  if (issueIds.has('metallic_highs')) {
-    modules.push('De-esser and harshness reduction: dynamically tames sharp upper-band vocal artifacts')
-  }
-  if (issueIds.has('dull_top_end')) {
-    modules.push('Brightness restoration: gently lifts missing top-end energy')
-  }
-  if (issueIds.has('codec_haze')) {
-    modules.push('Haze cleanup: reduces smeared low-mid buildup')
-  }
-  if (issueIds.has('congested_mix')) {
-    modules.push('Dynamic control: adds light compression where the mix is too dense')
-  }
-  if (issueIds.has('noise_floor')) {
-    modules.push('Conditional vocal denoising: runs only when a raised noise floor is detected')
-  }
-  if (!modules.length) {
-    modules.push('Gentle cleanup: keep the repair path conservative')
-  }
-
-  return modules
-}
-
-function recommendedIntensity(report?: ProjectDetail['analysis_report'] | null): 'light' | 'medium' | 'strong' {
-  if (!report?.issues.length) return 'medium'
-
-  const highCount = report.issues.filter((issue) => issue.severity === 'high').length
-  const mediumCount = report.issues.filter((issue) => issue.severity === 'medium').length
-  const hasRoboticVocals = report.issues.some((issue) => issue.id === 'robotic_vocals')
-
-  if (highCount >= 2 || (highCount >= 1 && mediumCount >= 2)) return 'strong'
-  if (hasRoboticVocals || highCount >= 1 || mediumCount >= 2) return 'medium'
-  return 'light'
-}
-
 export function App() {
   const [status, setStatus] = useState<AppStatus | null>(null)
   const [projects, setProjects] = useState<ProjectSummary[]>([])
@@ -275,8 +237,9 @@ export function App() {
   const previewAsset = selectedRun?.assets.find((a) => a.kind === 'mix_preview')
   const normalizedAsset = selectedRun?.assets.find((a) => a.kind === 'normalized_audio')
   const cleanedExport = selectedRun?.exports[0]
-  const repairModules = getRepairModules(selectedProject?.analysis_report)
-  const recommendedRepairIntensity = recommendedIntensity(selectedProject?.analysis_report)
+  const repairModules = selectedProject?.analysis_report?.planned_repair_modules ?? []
+  const recommendedRepairIntensity =
+    (selectedProject?.analysis_report?.suggested_intensity as 'light' | 'medium' | 'strong' | undefined) ?? 'medium'
   const extraAudioAssets =
     selectedRun?.assets.filter(
       (a) => !['mix_preview', 'normalized_audio', 'cleaned_export'].includes(a.kind),
@@ -708,9 +671,15 @@ export function App() {
               {selectedProject.analysis_report.issues.map((issue) => (
                 <article key={issue.id} className="analysis-card">
                   <div className={`severity severity-${issue.severity}`}>{issue.severity}</div>
-                  <h4>{issue.label}</h4>
+                  <h4>{issue.artifact_title ?? issue.label}</h4>
                   <p className="meta-text">Confidence: {issue.confidence ?? '—'}</p>
                   <p>{issue.description}</p>
+                  {issue.detection || issue.repair ? (
+                    <>
+                      {issue.detection ? <p className="meta-text"><strong>Detection:</strong> {issue.detection}</p> : null}
+                      {issue.repair ? <p className="meta-text"><strong>Repair:</strong> {issue.repair}</p> : null}
+                    </>
+                  ) : null}
                 </article>
               ))}
             </div>

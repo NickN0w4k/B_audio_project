@@ -11,6 +11,50 @@ from pathlib import Path
 import numpy as np
 
 
+ISSUE_STRATEGIES: dict[str, dict[str, str]] = {
+    "dull_top_end": {
+        "title": "High-Frequency Rolloff",
+        "detection": "Detected from missing top-band energy and a visible upper-band cutoff in the spectrogram.",
+        "repair": "Use conservative brightness shaping now; later upgrade path is generative top-end reconstruction per stem.",
+    },
+    "metallic_highs": {
+        "title": "Metallic Resonances",
+        "detection": "Detected from excess energy in the 6-10 kHz harshness band.",
+        "repair": "Use de-esser plus targeted upper-band reduction after separation, especially on vocals.",
+    },
+    "robotic_vocals": {
+        "title": "Robotic Quantization",
+        "detection": "Detected from overly uniform vocal-presence energy over time while upper vocal artifacts remain active.",
+        "repair": "Use vocal humanization EQ now; later upgrade path is dedicated vocal naturalization and formant-aware restoration.",
+    },
+    "codec_haze": {
+        "title": "Codec / Digital Haze",
+        "detection": "Detected from low-mid clustering and reduced spectral clarity.",
+        "repair": "Use low-mid cleanup and clarity compensation, ideally after stem separation to avoid damaging the full mix.",
+    },
+    "congested_mix": {
+        "title": "Congested Dynamics",
+        "detection": "Detected from dense RMS levels and reduced crest factor.",
+        "repair": "Use gentle dynamic control after repair, keeping restoration separate from final mastering.",
+    },
+    "noise_floor": {
+        "title": "Raised Noise Floor",
+        "detection": "Detected from unusually elevated quiet passages relative to the program level.",
+        "repair": "Use conditional vocal denoising only when the noise-floor flag is present.",
+    },
+    "room_smear": {
+        "title": "Room Smear / Baked-In Reverb",
+        "detection": "Detected from softened transient definition combined with persistent low-mid buildup.",
+        "repair": "Use only light clarity compensation now; a real de-reverb path remains a later dedicated module.",
+    },
+    "general_cleanup": {
+        "title": "General Cleanup",
+        "detection": "No dominant artifact class was detected with high confidence.",
+        "repair": "Keep the path conservative and avoid heavy restoration steps.",
+    },
+}
+
+
 def emit(payload: dict) -> None:
     print(json.dumps(payload), flush=True)
 
@@ -313,6 +357,39 @@ def compute_spectral_variation(audio: np.ndarray, sample_rate: int, low_hz: floa
     return float(np.std(band_energies) / mean_energy)
 
 
+def compute_transient_flatness(audio: np.ndarray, sample_rate: int) -> float | None:
+    if audio.size < 4096:
+        return None
+
+    n_fft = 2048
+    hop = 512
+    if audio.shape[0] < n_fft:
+        return None
+
+    frame_count = 1 + (audio.shape[0] - n_fft) // hop
+    if frame_count <= 1:
+        return None
+
+    window = np.hanning(n_fft).astype(np.float32)
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+    band_mask = (freqs >= 1000.0) & (freqs <= 6000.0)
+    if not np.any(band_mask):
+        return None
+
+    energies = np.empty(frame_count, dtype=np.float32)
+    for frame_index in range(frame_count):
+        start = frame_index * hop
+        frame = audio[start : start + n_fft] * window
+        spectrum = np.abs(np.fft.rfft(frame)).astype(np.float32)
+        energies[frame_index] = float(np.mean(spectrum[band_mask]))
+
+    mean_energy = float(np.mean(energies))
+    if mean_energy <= 1e-9:
+        return None
+
+    return float(np.percentile(energies, 95) / mean_energy)
+
+
 def write_audio_stereo(path: Path, audio: np.ndarray) -> None:
     write_audio_stereo_with_rate(path, audio, 48000)
 
@@ -383,10 +460,12 @@ def compute_analysis(normalized_path: Path) -> dict:
     crest_factor = peak / max(rms, 1e-6)
     vocal_presence_variation = compute_spectral_variation(audio, sample_rate, 2000.0, 6000.0)
     vocal_artifact_variation = compute_spectral_variation(audio, sample_rate, 6000.0, 10000.0)
+    transient_flatness = compute_transient_flatness(audio, sample_rate)
 
     issues: list[dict] = []
 
     def add_issue(issue_id: str, label: str, severity: str, description: str, confidence: float) -> None:
+        strategy = ISSUE_STRATEGIES.get(issue_id, ISSUE_STRATEGIES["general_cleanup"])
         issues.append(
             {
                 "id": issue_id,
@@ -394,6 +473,9 @@ def compute_analysis(normalized_path: Path) -> dict:
                 "severity": severity,
                 "confidence": round(max(0.0, min(confidence, 0.99)), 2),
                 "description": description,
+                "artifact_title": strategy["title"],
+                "detection": strategy["detection"],
+                "repair": strategy["repair"],
             }
         )
 
@@ -445,6 +527,17 @@ def compute_analysis(normalized_path: Path) -> dict:
             0.52 + min(0.28, (low_mid_band - 0.72) * 1.8),
         )
 
+    if transient_flatness is not None and low_mid_band > 0.68 and transient_flatness < 1.85:
+        add_issue(
+            "room_smear",
+            "Room smear",
+            "low",
+            "Transient definition looks softened while low-mid energy stays elevated, which can indicate baked-in reverb or smeared ambience.",
+            0.46
+            + min(0.2, (1.85 - transient_flatness) * 0.35)
+            + min(0.15, max(0.0, low_mid_band - 0.68) * 1.2),
+        )
+
     if noise_floor_ratio > 0.22 and transient_peak < 0.45:
         add_issue(
             "noise_floor",
@@ -471,6 +564,20 @@ def compute_analysis(normalized_path: Path) -> dict:
     elif len(issues) == 1 and issues[0]["id"] == "general_cleanup":
         recommended_preset = "gentle_cleanup"
 
+    high_count = sum(1 for issue in issues if issue["severity"] == "high")
+    medium_count = sum(1 for issue in issues if issue["severity"] == "medium")
+    has_robotic_vocals = any(issue["id"] == "robotic_vocals" for issue in issues)
+
+    suggested_intensity = "light"
+    if high_count >= 2 or (high_count >= 1 and medium_count >= 2):
+        suggested_intensity = "strong"
+    elif has_robotic_vocals or high_count >= 1 or medium_count >= 2:
+        suggested_intensity = "medium"
+
+    planned_repair_modules = list(dict.fromkeys(issue["repair"] for issue in issues if issue.get("repair")))
+    if not planned_repair_modules:
+        planned_repair_modules = ["Gentle cleanup: keep the repair path conservative"]
+
     return {
         "duration_sec": round(duration_sec, 2),
         "sample_rate": sample_rate,
@@ -486,8 +593,11 @@ def compute_analysis(normalized_path: Path) -> dict:
         "transient_peak": round(transient_peak, 4),
         "vocal_presence_variation": round(vocal_presence_variation, 4) if vocal_presence_variation is not None else None,
         "vocal_artifact_variation": round(vocal_artifact_variation, 4) if vocal_artifact_variation is not None else None,
+        "transient_flatness": round(transient_flatness, 4) if transient_flatness is not None else None,
         "overall_confidence": round(float(np.mean([issue["confidence"] for issue in issues])), 2),
         "issues": issues,
+        "suggested_intensity": suggested_intensity,
+        "planned_repair_modules": planned_repair_modules,
         "recommended_preset": recommended_preset,
         "runtime_estimate_sec": 45,
     }
@@ -567,6 +677,10 @@ def build_vocal_filter_chain(analysis: dict, intensity: str) -> str:
     if "dull_top_end" in issue_ids:
         filters.append(f"highshelf=f=7000:g={2.0 * scale:.2f}")
 
+    if "room_smear" in issue_ids:
+        filters.append(f"equalizer=f=2400:t=q:w=1.0:g={-0.8 * scale:.2f}")
+        filters.append(f"highshelf=f=8200:g={0.8 * scale:.2f}")
+
     if "metallic_highs" in issue_ids:
         threshold = 0.10 / scale
         amount = 0.35 * scale
@@ -593,6 +707,10 @@ def build_music_filter_chain(analysis: dict, intensity: str) -> str:
 
     if "dull_top_end" in issue_ids:
         filters.append(f"highshelf=f=9500:g={2.5 * scale:.2f}")
+
+    if "room_smear" in issue_ids:
+        filters.append(f"equalizer=f=2300:t=q:w=1.0:g={-1.0 * scale:.2f}")
+        filters.append(f"highshelf=f=9000:g={0.9 * scale:.2f}")
 
     if "codec_haze" in issue_ids:
         filters.append(f"equalizer=f=2600:t=q:w=1.2:g={-2.0 * scale:.2f}")
