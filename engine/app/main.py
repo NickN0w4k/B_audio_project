@@ -139,6 +139,147 @@ def load_audio_for_analysis(path: Path) -> tuple[np.ndarray, int]:
     return audio, 48000
 
 
+def generate_spectrogram_image(input_path: Path, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-lavfi",
+        "showspectrumpic=s=1800x900:legend=1:scale=log",
+        "-frames:v",
+        "1",
+        str(output_path),
+    ]
+
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "FFmpeg spectrogram generation failed")
+
+
+def estimate_lower_cutoff_knee_hz(freqs: np.ndarray, spectrum: np.ndarray) -> float | None:
+    if freqs.size == 0 or spectrum.size == 0:
+        return None
+
+    high_band_mask = freqs >= 12000
+    high_freqs = freqs[high_band_mask]
+    high_spectrum = spectrum[high_band_mask]
+    if high_freqs.size == 0:
+        return None
+
+    smoothed = np.convolve(high_spectrum, np.ones(41, dtype=np.float32) / 41.0, mode="same")
+    peak_level = float(np.max(smoothed))
+    if peak_level <= 0:
+        return None
+
+    normalized = smoothed / (peak_level + 1e-12)
+
+    best_freq: float | None = None
+    best_score = 0.0
+
+    # For this use case we only want the high cutoff knee near the top of the
+    # spectrum, not earlier dips around 15-17 kHz that can still contain a lot
+    # of energy. Search only in the top band.
+    for index in range(16, high_freqs.size - 16):
+        freq = float(high_freqs[index])
+        if freq < 17500:
+            continue
+
+        before_level = float(np.mean(normalized[index - 16 : index]))
+        after_level = float(np.mean(normalized[index + 1 : index + 17]))
+        if before_level <= 0.03:
+            continue
+
+        drop_ratio = after_level / (before_level + 1e-12)
+        drop_strength = before_level - after_level
+        freq_bias = max(0.0, min((freq - 17500.0) / 5000.0, 1.0))
+        score = drop_strength * (0.75 + freq_bias)
+
+        if drop_ratio < 0.92 and score > best_score:
+            best_score = score
+            best_freq = freq
+
+    if best_freq is not None:
+        return best_freq
+
+    active = np.where((high_freqs >= 17500) & (normalized >= 0.03))[0]
+    if active.size:
+        return float(high_freqs[active[-1]])
+
+    return None
+
+
+def estimate_spectrogram_cutoff_hz(audio: np.ndarray, sample_rate: int) -> float | None:
+    if audio.size < 4096:
+        return None
+
+    n_fft = 4096
+    hop = 1024
+    if audio.shape[0] < n_fft:
+        return None
+
+    frame_count = 1 + (audio.shape[0] - n_fft) // hop
+    if frame_count <= 0:
+        return None
+
+    window = np.hanning(n_fft).astype(np.float32)
+    spectrogram = np.empty((n_fft // 2 + 1, frame_count), dtype=np.float32)
+
+    for frame_index in range(frame_count):
+        start = frame_index * hop
+        frame = audio[start : start + n_fft] * window
+        spectrogram[:, frame_index] = np.abs(np.fft.rfft(frame)).astype(np.float32)
+
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+    high_mask = freqs >= 12000
+    high_freqs = freqs[high_mask]
+    high_spec = spectrogram[high_mask]
+    if high_freqs.size == 0 or high_spec.size == 0:
+        return None
+
+    # Collapse time conservatively: keep bins that are consistently present,
+    # which matches the visible horizontal cutoff line better than a single FFT.
+    time_profile = np.percentile(high_spec, 75, axis=1)
+    time_profile = np.convolve(time_profile, np.ones(9, dtype=np.float32) / 9.0, mode="same")
+    peak = float(np.max(time_profile))
+    if peak <= 0:
+        return None
+
+    normalized = time_profile / (peak + 1e-12)
+
+    best_freq: float | None = None
+    best_score = 0.0
+
+    for index in range(12, high_freqs.size - 12):
+        freq = float(high_freqs[index])
+        if freq < 17000:
+            continue
+
+        below = float(np.mean(normalized[index - 10 : index]))
+        above = float(np.mean(normalized[index + 1 : index + 11]))
+        if below <= 0.015:
+            continue
+
+        drop = below - above
+        ratio = above / (below + 1e-12)
+        score = drop * (0.5 + min((freq - 17000.0) / 7000.0, 1.0))
+
+        if ratio < 0.82 and score > best_score:
+            best_score = score
+            best_freq = freq
+
+    if best_freq is not None:
+        return best_freq
+
+    active = np.where((high_freqs >= 17000) & (normalized >= 0.015))[0]
+    if active.size:
+        return float(high_freqs[active[-1]])
+
+    return None
+
+
 def write_audio_stereo(path: Path, audio: np.ndarray) -> None:
     write_audio_stereo_with_rate(path, audio, 48000)
 
@@ -187,6 +328,7 @@ def compute_analysis(normalized_path: Path) -> dict:
     duration_sec = float(audio.shape[0] / sample_rate)
     peak = float(np.max(np.abs(audio)))
     rms = float(np.sqrt(np.mean(np.square(audio)) + 1e-12))
+    abs_audio = np.abs(audio)
 
     # Use a manageable analysis window for fast heuristics.
     window_size = min(audio.shape[0], sample_rate * 10)
@@ -199,57 +341,79 @@ def compute_analysis(normalized_path: Path) -> dict:
     harsh_band = float(np.sum(spectrum[(freqs >= 6000) & (freqs <= 10000)]) / total_energy)
     low_mid_band = float(np.sum(spectrum[(freqs >= 200) & (freqs <= 4000)]) / total_energy)
     centroid = float(np.sum(freqs * spectrum) / total_energy)
+    lower_cutoff_knee_hz = estimate_spectrogram_cutoff_hz(audio, sample_rate)
+    if lower_cutoff_knee_hz is None:
+        lower_cutoff_knee_hz = estimate_lower_cutoff_knee_hz(freqs, spectrum)
+    transient_peak = float(np.percentile(abs_audio, 95))
+    noise_floor = float(np.percentile(abs_audio, 10))
+    noise_floor_ratio = noise_floor / max(rms, 1e-6)
+    crest_factor = peak / max(rms, 1e-6)
 
     issues: list[dict] = []
 
-    if high_band < 0.045:
+    def add_issue(issue_id: str, label: str, severity: str, description: str, confidence: float) -> None:
         issues.append(
             {
-                "id": "dull_top_end",
-                "label": "Dull top end",
-                "severity": "high",
-                "description": "High-frequency energy is low compared with the rest of the track.",
+                "id": issue_id,
+                "label": label,
+                "severity": severity,
+                "confidence": round(max(0.0, min(confidence, 0.99)), 2),
+                "description": description,
             }
+        )
+
+    if high_band < 0.045:
+        add_issue(
+            "dull_top_end",
+            "Dull top end",
+            "high",
+            "High-frequency energy is low compared with the rest of the track.",
+            0.6 + min(0.35, (0.045 - high_band) * 8.0),
         )
 
     if harsh_band > 0.32:
-        issues.append(
-            {
-                "id": "metallic_highs",
-                "label": "Metallic highs",
-                "severity": "medium",
-                "description": "The upper spectrum has a strong concentration in the metallic harshness band.",
-            }
+        add_issue(
+            "metallic_highs",
+            "Metallic highs",
+            "medium",
+            "The upper spectrum has a strong concentration in the metallic harshness band.",
+            0.58 + min(0.32, (harsh_band - 0.32) * 2.8),
         )
 
-    if rms > 0.18 and peak / max(rms, 1e-6) < 3.2:
-        issues.append(
-            {
-                "id": "congested_mix",
-                "label": "Congested mix",
-                "severity": "medium",
-                "description": "The track appears dense and dynamically constrained.",
-            }
+    if rms > 0.18 and crest_factor < 3.2:
+        add_issue(
+            "congested_mix",
+            "Congested mix",
+            "medium",
+            "The track appears dense and dynamically constrained.",
+            0.55 + min(0.25, (3.2 - crest_factor) * 0.2),
         )
 
     if centroid < 3200 and low_mid_band > 0.72:
-        issues.append(
-            {
-                "id": "codec_haze",
-                "label": "Codec haze",
-                "severity": "medium",
-                "description": "Energy is clustered in the low-mid range, which can sound hazy or smeared.",
-            }
+        add_issue(
+            "codec_haze",
+            "Codec haze",
+            "medium",
+            "Energy is clustered in the low-mid range, which can sound hazy or smeared.",
+            0.52 + min(0.28, (low_mid_band - 0.72) * 1.8),
+        )
+
+    if noise_floor_ratio > 0.22 and transient_peak < 0.45:
+        add_issue(
+            "noise_floor",
+            "Raised noise floor",
+            "low",
+            "The quieter parts of the track sit unusually high, which may indicate broadband noise or persistent background residue.",
+            0.5 + min(0.25, (noise_floor_ratio - 0.22) * 1.5),
         )
 
     if not issues:
-        issues.append(
-            {
-                "id": "general_cleanup",
-                "label": "General cleanup",
-                "severity": "low",
-                "description": "No dominant defect class was detected, so a gentle cleanup path is recommended.",
-            }
+        add_issue(
+            "general_cleanup",
+            "General cleanup",
+            "low",
+            "No dominant defect class was detected, so a gentle cleanup path is recommended.",
+            0.4,
         )
 
     recommended_preset = "ai_song_cleanup"
@@ -265,9 +429,15 @@ def compute_analysis(normalized_path: Path) -> dict:
         "sample_rate": sample_rate,
         "peak": round(peak, 4),
         "rms": round(rms, 4),
+        "crest_factor": round(crest_factor, 3),
         "spectral_centroid_hz": round(centroid, 2),
+        "estimated_cutoff_hz": round(lower_cutoff_knee_hz, 2) if lower_cutoff_knee_hz is not None else None,
         "high_band_ratio": round(high_band, 4),
         "harsh_band_ratio": round(harsh_band, 4),
+        "noise_floor": round(noise_floor, 4),
+        "noise_floor_ratio": round(noise_floor_ratio, 4),
+        "transient_peak": round(transient_peak, 4),
+        "overall_confidence": round(float(np.mean([issue["confidence"] for issue in issues])), 2),
         "issues": issues,
         "recommended_preset": recommended_preset,
         "runtime_estimate_sec": 45,
@@ -296,6 +466,9 @@ def load_analysis_report(analysis_path: Path) -> dict:
 def analyze_project(input_path: Path, normalized_path: Path, analysis_path: Path, project_id: str) -> int:
     run_ffmpeg_normalize(input_path, normalized_path)
     analysis = compute_analysis(normalized_path)
+    spectrogram_path = analysis_path.parent / "analysis-spectrogram.png"
+    generate_spectrogram_image(normalized_path, spectrogram_path)
+    analysis["spectrogram_path"] = str(spectrogram_path)
     write_analysis_report(analysis_path, project_id, analysis)
     return 0
 

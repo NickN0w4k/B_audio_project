@@ -47,6 +47,7 @@ pub struct AnalysisIssue {
     pub id: String,
     pub label: String,
     pub severity: String,
+    pub confidence: Option<f64>,
     pub description: String,
 }
 
@@ -57,6 +58,9 @@ pub struct AnalysisReportRecord {
     pub report_path: String,
     pub recommended_preset: Option<String>,
     pub runtime_estimate_sec: Option<i64>,
+    pub overall_confidence: Option<f64>,
+    pub estimated_cutoff_hz: Option<f64>,
+    pub spectrogram_path: Option<String>,
     pub summary_json: Option<String>,
     pub created_at: String,
     pub issues: Vec<AnalysisIssue>,
@@ -425,6 +429,15 @@ impl Database {
                         report_path: row.get(2)?,
                         recommended_preset: row.get(3)?,
                         runtime_estimate_sec: row.get(4)?,
+                        overall_confidence: summary_json
+                            .as_deref()
+                            .and_then(parse_overall_confidence_from_summary),
+                        estimated_cutoff_hz: summary_json
+                            .as_deref()
+                            .and_then(parse_estimated_cutoff_from_summary),
+                        spectrogram_path: summary_json
+                            .as_deref()
+                            .and_then(parse_spectrogram_path_from_summary),
                         summary_json,
                         created_at: row.get(6)?,
                         issues,
@@ -911,9 +924,25 @@ fn parse_issues_from_summary(summary_json: &str) -> Option<Vec<AnalysisIssue>> {
                     id: issue.get("id")?.as_str()?.to_string(),
                     label: issue.get("label")?.as_str()?.to_string(),
                     severity: issue.get("severity")?.as_str()?.to_string(),
+                    confidence: issue.get("confidence").and_then(serde_json::Value::as_f64),
                     description: issue.get("description")?.as_str()?.to_string(),
                 })
             })
             .collect(),
     )
+}
+
+fn parse_overall_confidence_from_summary(summary_json: &str) -> Option<f64> {
+    let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
+    value.get("overall_confidence")?.as_f64()
+}
+
+fn parse_estimated_cutoff_from_summary(summary_json: &str) -> Option<f64> {
+    let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
+    value.get("estimated_cutoff_hz")?.as_f64()
+}
+
+fn parse_spectrogram_path_from_summary(summary_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
+    value.get("spectrogram_path")?.as_str().map(ToString::to_string)
 }

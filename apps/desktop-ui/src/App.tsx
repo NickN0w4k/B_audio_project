@@ -108,12 +108,16 @@ type ProjectDetail = {
     report_path: string
     recommended_preset?: string | null
     runtime_estimate_sec?: number | null
+    overall_confidence?: number | null
+    estimated_cutoff_hz?: number | null
+    spectrogram_path?: string | null
     summary_json?: string | null
     created_at: string
     issues: Array<{
       id: string
       label: string
       severity: string
+      confidence?: number | null
       description: string
     }>
   } | null
@@ -175,6 +179,12 @@ function assetLabel(kind: string): string {
     repaired_music: 'Repaired Music',
   }
   return labels[kind as AssetKind] ?? kind
+}
+
+function formatCutoffText(report?: ProjectDetail['analysis_report'] | null): string {
+  if (!report) return 'Detected cutoff: unavailable'
+  if (report.estimated_cutoff_hz == null) return 'Detected cutoff: not detected in this analysis report'
+  return `Detected cutoff: ${report.estimated_cutoff_hz} Hz`
 }
 
 export function App() {
@@ -609,12 +619,30 @@ export function App() {
               <div className="analysis-pill">
                 Est. runtime: {selectedProject.analysis_report.runtime_estimate_sec ?? '—'} sec
               </div>
+              <div className="analysis-pill">
+                Confidence: {selectedProject.analysis_report.overall_confidence ?? '—'}
+              </div>
             </div>
+            {selectedProject.analysis_report.spectrogram_path ? (
+              <article className="panel" style={{ marginBottom: '1rem' }}>
+                <h4>Spectrogram</h4>
+                <p className="meta-text">
+                  Use the frequency scale on the image to spot sharp high-frequency cutoffs and check whether any air remains above the cutoff region.
+                </p>
+                <p className="meta-text">{formatCutoffText(selectedProject.analysis_report)}</p>
+                <img
+                  className="spectrogram-image"
+                  src={toAudioSrc(selectedProject.analysis_report.spectrogram_path) ?? undefined}
+                  alt="Analysis spectrogram"
+                />
+              </article>
+            ) : null}
             <div className="analysis-grid">
               {selectedProject.analysis_report.issues.map((issue) => (
                 <article key={issue.id} className="analysis-card">
                   <div className={`severity severity-${issue.severity}`}>{issue.severity}</div>
                   <h4>{issue.label}</h4>
+                  <p className="meta-text">Confidence: {issue.confidence ?? '—'}</p>
                   <p>{issue.description}</p>
                 </article>
               ))}
