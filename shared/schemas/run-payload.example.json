@@ -1,0 +1,12 @@
+{
+  "project_id": "example-project",
+  "run_id": "example-run",
+  "input_path": "C:/Users/Nick/Desktop/B_audio_project/storage/test-input.wav",
+  "preset": "ai_song_cleanup",
+  "options": {
+    "intensity": "medium",
+    "apply_light_finishing": false,
+    "export_stems": false,
+    "gpu_enabled": true
+  }
+}

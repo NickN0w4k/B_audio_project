@@ -1,0 +1,7 @@
+{
+  "project_id": "example-project",
+  "run_id": "example-run",
+  "preset": "ai_song_cleanup",
+  "normalized_path": "C:\\Users\\Nick\\Desktop\\source\\normalized.wav",
+  "status": "completed"
+}

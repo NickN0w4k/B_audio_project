@@ -1,0 +1,18 @@
+{
+  "name": "b-audio-project",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local desktop app for AI-generated song cleanup.",
+  "workspaces": [
+    "apps/desktop-ui"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace desktop-ui",
+    "desktop:dev": "npx tauri dev --config src-tauri/tauri.conf.json",
+    "build": "npm run build --workspace desktop-ui",
+    "check": "npm run check --workspace desktop-ui"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.0"
+  }
+}
