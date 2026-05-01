@@ -280,6 +280,39 @@ def estimate_spectrogram_cutoff_hz(audio: np.ndarray, sample_rate: int) -> float
     return None
 
 
+def compute_spectral_variation(audio: np.ndarray, sample_rate: int, low_hz: float, high_hz: float) -> float | None:
+    if audio.size < 4096:
+        return None
+
+    n_fft = 2048
+    hop = 512
+    if audio.shape[0] < n_fft:
+        return None
+
+    frame_count = 1 + (audio.shape[0] - n_fft) // hop
+    if frame_count <= 1:
+        return None
+
+    window = np.hanning(n_fft).astype(np.float32)
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+    band_mask = (freqs >= low_hz) & (freqs <= high_hz)
+    if not np.any(band_mask):
+        return None
+
+    band_energies = np.empty(frame_count, dtype=np.float32)
+    for frame_index in range(frame_count):
+        start = frame_index * hop
+        frame = audio[start : start + n_fft] * window
+        spectrum = np.abs(np.fft.rfft(frame)).astype(np.float32)
+        band_energies[frame_index] = float(np.mean(spectrum[band_mask]))
+
+    mean_energy = float(np.mean(band_energies))
+    if mean_energy <= 1e-9:
+        return None
+
+    return float(np.std(band_energies) / mean_energy)
+
+
 def write_audio_stereo(path: Path, audio: np.ndarray) -> None:
     write_audio_stereo_with_rate(path, audio, 48000)
 
@@ -348,6 +381,8 @@ def compute_analysis(normalized_path: Path) -> dict:
     noise_floor = float(np.percentile(abs_audio, 10))
     noise_floor_ratio = noise_floor / max(rms, 1e-6)
     crest_factor = peak / max(rms, 1e-6)
+    vocal_presence_variation = compute_spectral_variation(audio, sample_rate, 2000.0, 6000.0)
+    vocal_artifact_variation = compute_spectral_variation(audio, sample_rate, 6000.0, 10000.0)
 
     issues: list[dict] = []
 
@@ -379,6 +414,18 @@ def compute_analysis(normalized_path: Path) -> dict:
             "The upper spectrum has a strong concentration in the metallic harshness band.",
             0.58 + min(0.32, (harsh_band - 0.32) * 2.8),
         )
+
+    if vocal_presence_variation is not None and vocal_artifact_variation is not None:
+        if vocal_presence_variation < 0.28 and vocal_artifact_variation > 0.22:
+            add_issue(
+                "robotic_vocals",
+                "Robotic vocals",
+                "medium",
+                "The vocal-presence region is unusually uniform over time while upper vocal artifacts remain active, which can sound synthetic or auto-tuned.",
+                0.5
+                + min(0.2, (0.28 - vocal_presence_variation) * 1.5)
+                + min(0.2, max(0.0, vocal_artifact_variation - 0.22) * 1.5),
+            )
 
     if rms > 0.18 and crest_factor < 3.2:
         add_issue(
@@ -437,6 +484,8 @@ def compute_analysis(normalized_path: Path) -> dict:
         "noise_floor": round(noise_floor, 4),
         "noise_floor_ratio": round(noise_floor_ratio, 4),
         "transient_peak": round(transient_peak, 4),
+        "vocal_presence_variation": round(vocal_presence_variation, 4) if vocal_presence_variation is not None else None,
+        "vocal_artifact_variation": round(vocal_artifact_variation, 4) if vocal_artifact_variation is not None else None,
         "overall_confidence": round(float(np.mean([issue["confidence"] for issue in issues])), 2),
         "issues": issues,
         "recommended_preset": recommended_preset,
@@ -495,18 +544,40 @@ def build_filter_chain(analysis: dict) -> str:
     return ",".join(filters)
 
 
-def build_vocal_filter_chain(analysis: dict) -> str:
+def intensity_scale(intensity: str) -> float:
+    return {
+        "light": 0.75,
+        "medium": 1.0,
+        "strong": 1.35,
+    }.get(intensity, 1.0)
+
+
+def build_vocal_filter_chain(analysis: dict, intensity: str) -> str:
     issue_ids = {issue["id"] for issue in analysis["issues"]}
+    scale = intensity_scale(intensity)
     filters = ["highpass=f=90"]
 
+    if "robotic_vocals" in issue_ids:
+        # Conservative vocal humanization: soften static presence buildup and
+        # gently smooth the upper vocal band without introducing synthetic pitch
+        # processing or modulation artifacts.
+        filters.append(f"equalizer=f=3200:t=q:w=1.2:g={-1.5 * scale:.2f}")
+        filters.append(f"equalizer=f=6800:t=q:w=1.6:g={-1.5 * scale:.2f}")
+
     if "dull_top_end" in issue_ids:
-        filters.append("highshelf=f=7000:g=2")
+        filters.append(f"highshelf=f=7000:g={2.0 * scale:.2f}")
 
     if "metallic_highs" in issue_ids:
-        filters.append("equalizer=f=7600:t=q:w=1.5:g=-3")
+        threshold = 0.10 / scale
+        amount = 0.35 * scale
+        filters.append(
+            f"deesser=i={amount:.2f}:m=0.5:f=0.5:s=o:threshold={threshold:.3f}:t=0"
+        )
+        filters.append(f"equalizer=f=7600:t=q:w=1.5:g={-3.0 * scale:.2f}")
 
     if "congested_mix" in issue_ids:
-        filters.append("acompressor=threshold=0.18:ratio=1.5:attack=20:release=120")
+        ratio = 1.0 + (0.5 * scale)
+        filters.append(f"acompressor=threshold=0.18:ratio={ratio:.2f}:attack=20:release=120")
 
     # No limiter here — this is an intermediate stem, not the final output.
     # The final mix gets limited during export.
@@ -515,21 +586,23 @@ def build_vocal_filter_chain(analysis: dict) -> str:
     return ",".join(filters)
 
 
-def build_music_filter_chain(analysis: dict) -> str:
+def build_music_filter_chain(analysis: dict, intensity: str) -> str:
     issue_ids = {issue["id"] for issue in analysis["issues"]}
+    scale = intensity_scale(intensity)
     filters: list[str] = []
 
     if "dull_top_end" in issue_ids:
-        filters.append("highshelf=f=9500:g=2.5")
+        filters.append(f"highshelf=f=9500:g={2.5 * scale:.2f}")
 
     if "codec_haze" in issue_ids:
-        filters.append("equalizer=f=2600:t=q:w=1.2:g=-2")
+        filters.append(f"equalizer=f=2600:t=q:w=1.2:g={-2.0 * scale:.2f}")
 
     if "metallic_highs" in issue_ids:
-        filters.append("equalizer=f=8200:t=q:w=1.4:g=-2")
+        filters.append(f"equalizer=f=8200:t=q:w=1.4:g={-2.0 * scale:.2f}")
 
     if "congested_mix" in issue_ids:
-        filters.append("acompressor=threshold=0.12:ratio=1.8:attack=10:release=80")
+        ratio = 1.0 + (0.8 * scale)
+        filters.append(f"acompressor=threshold=0.12:ratio={ratio:.2f}:attack=10:release=80")
 
     filters.append("alimiter=limit=0.93")
     return ",".join(filters)
@@ -580,13 +653,67 @@ def split_stems(normalized_path: Path, vocals_path: Path, music_path: Path, gpu_
     write_audio_stereo_with_rate(music_path, normalize_peak(music), model.samplerate)
 
 
+def denoise_vocals_with_deepfilternet(
+    vocals_path: Path,
+    output_path: Path,
+    gpu_enabled: bool,
+) -> None:
+    if importlib.util.find_spec("df") is None:
+        raise RuntimeError(
+            "DeepFilterNet is not installed. Install engine dependencies with `python -m pip install -r engine/requirements.txt`."
+        )
+
+    import torch
+
+    from df.enhance import enhance as df_enhance
+    from df.enhance import init_df
+
+    model, df_state, _suffix = init_df()
+    df_sample_rate = df_state.sr()
+    prepared_vocals_path = vocals_path
+
+    if df_sample_rate != 44100:
+        prepared_vocals_path = output_path.parent / "vocals_for_df.wav"
+        resample_audio_file(vocals_path, prepared_vocals_path, df_sample_rate)
+
+    audio = load_audio(prepared_vocals_path, df_sample_rate, 2)
+    waveform = torch.from_numpy(audio.T.copy()).float()
+    enhanced = df_enhance(
+        model,
+        df_state,
+        waveform,
+        pad=True,
+        atten_lim_db=6.0,
+    )
+    enhanced_audio = enhanced.detach().cpu().numpy().T
+    enhanced_path = output_path
+
+    if df_sample_rate != 44100:
+        enhanced_path = output_path.parent / "vocals_denoised_df_48k.wav"
+
+    write_audio_stereo_with_rate(enhanced_path, enhanced_audio, df_sample_rate)
+
+    if enhanced_path != output_path:
+        resample_audio_file(enhanced_path, output_path, 44100)
+
+
 def repair_vocals(
     vocals_path: Path,
     repaired_vocals_path: Path,
     analysis: dict,
+    intensity: str,
+    gpu_enabled: bool,
 ) -> None:
-    filter_chain = build_vocal_filter_chain(analysis)
-    run_ffmpeg_filter(vocals_path, repaired_vocals_path, filter_chain)
+    issue_ids = {issue["id"] for issue in analysis["issues"]}
+    filtered_input_path = vocals_path
+
+    if "noise_floor" in issue_ids:
+        denoised_vocals_path = repaired_vocals_path.parent / "vocals_denoised.wav"
+        denoise_vocals_with_deepfilternet(vocals_path, denoised_vocals_path, gpu_enabled)
+        filtered_input_path = denoised_vocals_path
+
+    filter_chain = build_vocal_filter_chain(analysis, intensity)
+    run_ffmpeg_filter(filtered_input_path, repaired_vocals_path, filter_chain)
 
 
 def reconstruct_mix(vocals_path: Path, music_path: Path, preview_path: Path) -> None:
@@ -709,6 +836,8 @@ def run(payload_path: Path) -> int:
     run_id = payload["run_id"]
     input_path = Path(payload["input_path"])
     analysis_report_path = payload.get("analysis_report_path")
+    intensity = str(payload.get("options", {}).get("intensity", "medium"))
+    gpu_enabled = bool(payload.get("options", {}).get("gpu_enabled", True))
     run_dir = payload_path.parent
     project_dir = run_dir.parent.parent
     normalized_path = project_dir / "source" / "normalized.wav"
@@ -764,12 +893,14 @@ def run(payload_path: Path) -> int:
                 vocals_path,
                 repaired_vocals_path,
                 analysis,
+                intensity,
+                gpu_enabled,
             )
         elif step == "repair_music":
             if analysis is None:
                 raise RuntimeError("Analysis must exist before music repair")
 
-            run_ffmpeg_filter(music_path, repaired_music_path, build_music_filter_chain(analysis))
+            run_ffmpeg_filter(music_path, repaired_music_path, build_music_filter_chain(analysis, intensity))
         elif step == "reconstruct_mix":
             reconstruct_mix(repaired_vocals_path, repaired_music_path, preview_path)
             export_cleaned_mix(preview_path, export_path)

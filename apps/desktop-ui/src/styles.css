@@ -261,6 +261,29 @@ input {
   color: #a9b9d4;
 }
 
+.module-list {
+  margin: 0.75rem 0 0;
+  padding-left: 1.25rem;
+  color: #c9d6ea;
+}
+
+.module-list li {
+  margin-bottom: 0.55rem;
+}
+
+.module-list.compact {
+  margin-top: 0.5rem;
+}
+
+.module-list.compact li {
+  margin-bottom: 0.4rem;
+  color: #b9c7de;
+}
+
+.intensity-description {
+  margin-top: 0.85rem;
+}
+
 .spectrogram-image {
   width: 100%;
   display: block;
