@@ -11,6 +11,9 @@ from pathlib import Path
 import numpy as np
 
 
+ANALYSIS_REPORT_SCHEMA_VERSION = "1.0"
+
+
 ISSUE_STRATEGIES: dict[str, dict[str, str]] = {
     "dull_top_end": {
         "title": "High-Frequency Rolloff",
@@ -610,6 +613,7 @@ def write_analysis_report(
     run_id: str | None = None,
 ) -> None:
     analysis_report = {
+        "schema_version": ANALYSIS_REPORT_SCHEMA_VERSION,
         "project_id": project_id,
         "run_id": run_id,
         **analysis,

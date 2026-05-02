@@ -59,6 +59,8 @@ pub struct AnalysisReportRecord {
     pub id: String,
     pub project_id: String,
     pub report_path: String,
+    pub schema_version: Option<String>,
+    pub compatibility_notice: Option<String>,
     pub recommended_preset: Option<String>,
     pub suggested_intensity: Option<String>,
     pub planned_repair_modules: Vec<String>,
@@ -137,6 +139,15 @@ pub struct NewRunResult {
 pub struct Database {
     path: PathBuf,
 }
+
+#[derive(Clone, Copy)]
+struct IssueStrategy {
+    title: &'static str,
+    detection: &'static str,
+    repair: &'static str,
+}
+
+const GENERAL_CLEANUP_REPAIR: &str = "Gentle cleanup: keep the repair path conservative";
 
 impl Database {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
@@ -423,23 +434,35 @@ impl Database {
                 params![project_id],
                 |row| {
                     let summary_json: Option<String> = row.get(5)?;
+                    let schema_version = summary_json
+                        .as_deref()
+                        .and_then(parse_schema_version_from_summary);
+                    let legacy_report = schema_version.is_none();
                     let issues = summary_json
                         .as_deref()
                         .and_then(parse_issues_from_summary)
                         .unwrap_or_default();
+                    let suggested_intensity = summary_json
+                        .as_deref()
+                        .and_then(parse_suggested_intensity_from_summary)
+                        .or_else(|| derive_suggested_intensity(&issues));
+                    let planned_repair_modules = summary_json
+                        .as_deref()
+                        .and_then(parse_planned_repair_modules_from_summary)
+                        .unwrap_or_else(|| derive_planned_repair_modules(&issues));
 
                     Ok(AnalysisReportRecord {
                         id: row.get(0)?,
                         project_id: row.get(1)?,
                         report_path: row.get(2)?,
+                        schema_version,
+                        compatibility_notice: legacy_report.then_some(
+                            "Legacy analysis report detected. Some guidance fields were reconstructed during load."
+                                .to_string(),
+                        ),
                         recommended_preset: row.get(3)?,
-                        suggested_intensity: summary_json
-                            .as_deref()
-                            .and_then(parse_suggested_intensity_from_summary),
-                        planned_repair_modules: summary_json
-                            .as_deref()
-                            .and_then(parse_planned_repair_modules_from_summary)
-                            .unwrap_or_default(),
+                        suggested_intensity,
+                        planned_repair_modules,
                         runtime_estimate_sec: row.get(4)?,
                         overall_confidence: summary_json
                             .as_deref()
@@ -932,8 +955,10 @@ fn parse_issues_from_summary(summary_json: &str) -> Option<Vec<AnalysisIssue>> {
         issues
             .iter()
             .filter_map(|issue| {
+                let issue_id = issue.get("id")?.as_str()?.to_string();
+                let strategy = issue_strategy(&issue_id);
                 Some(AnalysisIssue {
-                    id: issue.get("id")?.as_str()?.to_string(),
+                    id: issue_id,
                     label: issue.get("label")?.as_str()?.to_string(),
                     severity: issue.get("severity")?.as_str()?.to_string(),
                     confidence: issue.get("confidence").and_then(serde_json::Value::as_f64),
@@ -941,15 +966,18 @@ fn parse_issues_from_summary(summary_json: &str) -> Option<Vec<AnalysisIssue>> {
                     artifact_title: issue
                         .get("artifact_title")
                         .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string),
+                        .map(ToString::to_string)
+                        .or_else(|| strategy.map(|value| value.title.to_string())),
                     detection: issue
                         .get("detection")
                         .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string),
+                        .map(ToString::to_string)
+                        .or_else(|| strategy.map(|value| value.detection.to_string())),
                     repair: issue
                         .get("repair")
                         .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string),
+                        .map(ToString::to_string)
+                        .or_else(|| strategy.map(|value| value.repair.to_string())),
                 })
             })
             .collect(),
@@ -979,6 +1007,14 @@ fn parse_suggested_intensity_from_summary(summary_json: &str) -> Option<String> 
         .map(ToString::to_string)
 }
 
+fn parse_schema_version_from_summary(summary_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
+    value
+        .get("schema_version")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
 fn parse_planned_repair_modules_from_summary(summary_json: &str) -> Option<Vec<String>> {
     let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
     let modules = value.get("planned_repair_modules")?.as_array()?;
@@ -989,4 +1025,81 @@ fn parse_planned_repair_modules_from_summary(summary_json: &str) -> Option<Vec<S
             .filter_map(|module| module.as_str().map(ToString::to_string))
             .collect(),
     )
+}
+
+fn derive_suggested_intensity(issues: &[AnalysisIssue]) -> Option<String> {
+    if issues.is_empty() {
+        return Some("medium".to_string());
+    }
+
+    let high_count = issues.iter().filter(|issue| issue.severity == "high").count();
+    let medium_count = issues.iter().filter(|issue| issue.severity == "medium").count();
+    let has_robotic_vocals = issues.iter().any(|issue| issue.id == "robotic_vocals");
+
+    let suggested = if high_count >= 2 || (high_count >= 1 && medium_count >= 2) {
+        "strong"
+    } else if has_robotic_vocals || high_count >= 1 || medium_count >= 2 {
+        "medium"
+    } else {
+        "light"
+    };
+
+    Some(suggested.to_string())
+}
+
+fn derive_planned_repair_modules(issues: &[AnalysisIssue]) -> Vec<String> {
+    let mut modules: Vec<String> = issues.iter().filter_map(|issue| issue.repair.clone()).collect();
+    modules.dedup();
+
+    if modules.is_empty() {
+        modules.push(GENERAL_CLEANUP_REPAIR.to_string());
+    }
+
+    modules
+}
+
+fn issue_strategy(issue_id: &str) -> Option<IssueStrategy> {
+    match issue_id {
+        "dull_top_end" => Some(IssueStrategy {
+            title: "High-Frequency Rolloff",
+            detection: "Detected from missing top-band energy and a visible upper-band cutoff in the spectrogram.",
+            repair: "Use conservative brightness shaping now; later upgrade path is generative top-end reconstruction per stem.",
+        }),
+        "metallic_highs" => Some(IssueStrategy {
+            title: "Metallic Resonances",
+            detection: "Detected from excess energy in the 6-10 kHz harshness band.",
+            repair: "Use de-esser plus targeted upper-band reduction after separation, especially on vocals.",
+        }),
+        "robotic_vocals" => Some(IssueStrategy {
+            title: "Robotic Quantization",
+            detection: "Detected from overly uniform vocal-presence energy over time while upper vocal artifacts remain active.",
+            repair: "Use vocal humanization EQ now; later upgrade path is dedicated vocal naturalization and formant-aware restoration.",
+        }),
+        "codec_haze" => Some(IssueStrategy {
+            title: "Codec / Digital Haze",
+            detection: "Detected from low-mid clustering and reduced spectral clarity.",
+            repair: "Use low-mid cleanup and clarity compensation, ideally after stem separation to avoid damaging the full mix.",
+        }),
+        "congested_mix" => Some(IssueStrategy {
+            title: "Congested Dynamics",
+            detection: "Detected from dense RMS levels and reduced crest factor.",
+            repair: "Use gentle dynamic control after repair, keeping restoration separate from final mastering.",
+        }),
+        "noise_floor" => Some(IssueStrategy {
+            title: "Raised Noise Floor",
+            detection: "Detected from unusually elevated quiet passages relative to the program level.",
+            repair: "Use conditional vocal denoising only when the noise-floor flag is present.",
+        }),
+        "room_smear" => Some(IssueStrategy {
+            title: "Room Smear / Baked-In Reverb",
+            detection: "Detected from softened transient definition combined with persistent low-mid buildup.",
+            repair: "Use only light clarity compensation now; a real de-reverb path remains a later dedicated module.",
+        }),
+        "general_cleanup" => Some(IssueStrategy {
+            title: "General Cleanup",
+            detection: "No dominant artifact class was detected with high confidence.",
+            repair: "Keep the path conservative and avoid heavy restoration steps.",
+        }),
+        _ => None,
+    }
 }

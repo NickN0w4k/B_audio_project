@@ -106,6 +106,8 @@ type ProjectDetail = {
     id: string
     project_id: string
     report_path: string
+    schema_version?: string | null
+    compatibility_notice?: string | null
     recommended_preset?: string | null
     suggested_intensity?: string | null
     planned_repair_modules: string[]
@@ -644,7 +646,22 @@ export function App() {
               <div className="analysis-pill">
                 Suggested intensity: {recommendedRepairIntensity}
               </div>
+              <div className="analysis-pill">
+                Report schema: {selectedProject.analysis_report.schema_version ?? 'unknown'}
+              </div>
             </div>
+            {selectedProject.analysis_report.compatibility_notice ? (
+              <article className="panel" style={{ marginBottom: '1rem' }}>
+                <p className="meta-text">{selectedProject.analysis_report.compatibility_notice}</p>
+                <button
+                  type="button"
+                  onClick={() => void runProjectAnalysis(selectedProject.project.id)}
+                  disabled={isAnalyzing || isRunning}
+                >
+                  {isAnalyzing ? 'Re-running Analysis...' : 'Re-run Analysis with Current Schema'}
+                </button>
+              </article>
+            ) : null}
             {selectedProject.analysis_report.spectrogram_path ? (
               <article className="panel" style={{ marginBottom: '1rem' }}>
                 <h4>Spectrogram</h4>
