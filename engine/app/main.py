@@ -790,7 +790,7 @@ def denoise_vocals_with_deepfilternet(
     from df.enhance import enhance as df_enhance
     from df.enhance import init_df
 
-    model, df_state, _suffix = init_df()
+    model, df_state, _suffix = init_df(default_model="DeepFilterNet3")
     df_sample_rate = df_state.sr()
     prepared_vocals_path = vocals_path
 
@@ -1093,6 +1093,7 @@ def reexport(preview_path: Path, export_path: Path, fmt: str) -> None:
 
 def parse_reexport_argv() -> tuple[Path, Path, str]:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--reexport", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--preview", type=Path, required=True)
     parser.add_argument("--export-path", type=Path, required=True)
     parser.add_argument("--format", type=str, default="wav")

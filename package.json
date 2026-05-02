@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "npm run dev --workspace desktop-ui",
     "desktop:dev": "npx tauri dev --config src-tauri/tauri.conf.json",
+    "desktop:pyside": ".venv\\Scripts\\python.exe apps/desktop-pyside/main.py",
     "build": "npm run build --workspace desktop-ui",
     "check": "npm run check --workspace desktop-ui"
   },

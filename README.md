@@ -53,7 +53,7 @@ Install engine dependencies before running the cleanup pipeline:
 python -m pip install -r engine/requirements.txt
 ```
 
-The current pipeline expects `ffmpeg` on `PATH`, uses `Demucs` for stem separation, and uses `DeepFilterNet` for vocal cleanup.
+The current pipeline expects `ffmpeg` on `PATH`, uses `Demucs` for stem separation, and uses `DeepFilterNet 3` for vocal cleanup.
 
 Current runtime note: the `deepfilternet` package is not fully compatible with the installed modern `torchaudio` API, so the engine uses the DeepFilterNet core model with local FFmpeg-based audio I/O instead of the package's default file loading helpers.
 
