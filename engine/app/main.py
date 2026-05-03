@@ -1387,7 +1387,7 @@ def run(payload_path: Path) -> int:
     repaired_vocals_path = stems_dir / "vocals_repaired.wav"
     repaired_music_path = stems_dir / "music_repaired.wav"
     preview_path = run_dir / "previews" / "mix_preview.wav"
-    repaired_spectrogram_path = run_dir / "previews" / "mix_preview_spectrogram.png"
+    repaired_spectrogram_path = run_dir / "exports" / "song_cleaned_spectrogram.png"
     export_path = run_dir / "exports" / "song_cleaned.wav"
     report_path = run_dir / "run-report.json"
     analysis: dict | None = None
@@ -1450,8 +1450,8 @@ def run(payload_path: Path) -> int:
             repair_music(music_path, repaired_music_path, analysis, intensity)
         elif step == "reconstruct_mix":
             reconstruct_mix(repaired_vocals_path, repaired_music_path, preview_path, analysis)
-            generate_spectrogram_image(preview_path, repaired_spectrogram_path)
             export_cleaned_mix(preview_path, export_path)
+            generate_spectrogram_image(export_path, repaired_spectrogram_path)
             before_metrics = compute_mix_metrics(normalized_path)
             after_metrics = compute_mix_metrics(preview_path)
             metric_deltas = compute_metric_deltas(before_metrics, after_metrics)

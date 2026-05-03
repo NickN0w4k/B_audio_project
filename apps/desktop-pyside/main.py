@@ -8,6 +8,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, QUrl, Signal
@@ -68,6 +69,35 @@ def intensity_description(intensity: str) -> str:
         "strong": "Uses deeper EQ cuts, boosts, and stronger dynamic control. Best for obvious artifacts, but more likely to change the original tone.",
     }
     return descriptions.get(intensity, "")
+
+
+def preset_description(preset: str) -> str:
+    descriptions = {
+        "ai_song_cleanup": "Best overall repair path for mixed AI-song defects like robotic vocals, harsh highs, haze, and smeared reconstruction.",
+        "restore_brightness": "Best when the main issue is missing air and top-end detail rather than strong vocal or mix defects.",
+        "reduce_metallic_harshness": "Best when the track sounds brittle, metallic, or overly sharp in the upper bands.",
+        "gentle_cleanup": "Best when the song already sounds close and you only want a light repair pass with lower risk.",
+    }
+    return descriptions.get(preset, "Balanced restoration path for common AI-generated song defects.")
+
+
+def runtime_hint(report: dict | None, preset: str, intensity: str, gpu_enabled: bool) -> str:
+    base_runtime = int((report or {}).get("runtime_estimate_sec") or 45)
+    preset_multiplier = {
+        "ai_song_cleanup": 1.0,
+        "restore_brightness": 0.85,
+        "reduce_metallic_harshness": 0.9,
+        "gentle_cleanup": 0.75,
+    }.get(preset, 1.0)
+    intensity_multiplier = {
+        "light": 0.85,
+        "medium": 1.0,
+        "strong": 1.2,
+    }.get(intensity, 1.0)
+    device_multiplier = 1.0 if gpu_enabled else 2.2
+    estimate = max(20, int(base_runtime * preset_multiplier * intensity_multiplier * device_multiplier))
+    mode = "GPU" if gpu_enabled else "CPU"
+    return f"Estimated runtime: about {estimate} sec on {mode}."
 
 
 def format_cutoff_text(report: dict | None) -> str:
@@ -329,6 +359,8 @@ class Database:
             }
             if "failure_message" not in columns:
                 connection.execute("ALTER TABLE pipeline_runs ADD COLUMN failure_message TEXT")
+            if "user_feedback" not in columns:
+                connection.execute("ALTER TABLE pipeline_runs ADD COLUMN user_feedback TEXT")
 
     def list_projects(self) -> list[sqlite3.Row]:
         with self.connection() as connection:
@@ -370,7 +402,7 @@ class Database:
 
             latest_run = connection.execute(
                 """
-                SELECT id, project_id, preset, intensity, status, started_at, finished_at, report_path, failure_message
+                SELECT id, project_id, preset, intensity, status, started_at, finished_at, report_path, failure_message, user_feedback
                 FROM pipeline_runs
                 WHERE project_id = ?
                 ORDER BY rowid DESC
@@ -424,7 +456,7 @@ class Database:
         with self.connection() as connection:
             run = connection.execute(
                 """
-                SELECT id, project_id, preset, intensity, status, started_at, finished_at, report_path, failure_message
+                SELECT id, project_id, preset, intensity, status, started_at, finished_at, report_path, failure_message, user_feedback
                 FROM pipeline_runs
                 WHERE id = ?
                 """,
@@ -710,6 +742,13 @@ class Database:
                 (str(uuid.uuid4()), project_id, run_id, "cleaned_export", path),
             )
 
+    def set_run_feedback(self, run_id: str, feedback: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE pipeline_runs SET user_feedback = ? WHERE id = ?",
+                (feedback, run_id),
+            )
+
 
 class AnalyzeWorker(QThread):
     finished_ok = Signal(str)
@@ -755,6 +794,7 @@ class RunWorker(QThread):
     progress = Signal(str, str, str, float)
     finished_ok = Signal(str)
     failed = Signal(str)
+    cancelled = Signal(str)
 
     def __init__(
         self,
@@ -776,6 +816,9 @@ class RunWorker(QThread):
         self.export_stems = export_stems
         self.apply_finishing = apply_finishing
         self.gpu_enabled = gpu_enabled
+        self.process: subprocess.Popen[str] | None = None
+        self.run_id: str | None = None
+        self._cancel_requested = False
 
     def run(self) -> None:
         try:
@@ -785,6 +828,7 @@ class RunWorker(QThread):
                 raise RuntimeError("Run analysis first before starting cleanup.")
 
             run_id, payload_path = self.db.create_run(self.project_id, self.preset, self.intensity)
+            self.run_id = run_id
             payload = {
                 "project_id": self.project_id,
                 "run_id": run_id,
@@ -806,9 +850,12 @@ class RunWorker(QThread):
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            self.process = process
             self.db.update_run_progress(run_id, "running")
             assert process.stdout is not None
             for raw_line in process.stdout:
+                if self._cancel_requested:
+                    break
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -831,6 +878,11 @@ class RunWorker(QThread):
 
             stderr_output = process.stderr.read() if process.stderr is not None else ""
             return_code = process.wait()
+            self.process = None
+            if self._cancel_requested:
+                self.db.fail_run(run_id, "Run cancelled by user")
+                self.cancelled.emit(run_id)
+                return
             if return_code != 0:
                 failure_message = stderr_output.strip() or "Engine process failed"
                 self.db.fail_run(run_id, failure_message)
@@ -839,6 +891,11 @@ class RunWorker(QThread):
             self.finished_ok.emit(run_id)
         except Exception as error:  # noqa: BLE001
             self.failed.emit(str(error))
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
 
 
 class ExportWorker(QThread):
@@ -1034,6 +1091,8 @@ class ABCompareDeck(QWidget):
         self.active_key = "a"
         self.source_a: str | None = None
         self.source_b: str | None = None
+        self.loop_start_ms: int | None = None
+        self.loop_end_ms: int | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -1092,6 +1151,25 @@ class ABCompareDeck(QWidget):
         timeline_row.addWidget(self.duration_label)
         layout.addLayout(timeline_row)
 
+        loop_row = QHBoxLayout()
+        self.loop_set_start_button = QPushButton("Set Loop In")
+        self.loop_set_start_button.setObjectName("transportGhost")
+        self.loop_set_start_button.clicked.connect(self.set_loop_start)
+        self.loop_set_end_button = QPushButton("Set Loop Out")
+        self.loop_set_end_button.setObjectName("transportGhost")
+        self.loop_set_end_button.clicked.connect(self.set_loop_end)
+        self.loop_clear_button = QPushButton("Clear Loop")
+        self.loop_clear_button.setObjectName("transportGhost")
+        self.loop_clear_button.clicked.connect(self.clear_loop)
+        self.loop_label = QLabel("Loop: off")
+        self.loop_label.setObjectName("audioMeta")
+        loop_row.addWidget(self.loop_set_start_button)
+        loop_row.addWidget(self.loop_set_end_button)
+        loop_row.addWidget(self.loop_clear_button)
+        loop_row.addWidget(self.loop_label)
+        loop_row.addStretch(1)
+        layout.addLayout(loop_row)
+
         controls_row = QHBoxLayout()
         self.play_button = QPushButton("Play")
         self.play_button.setObjectName("transportPrimary")
@@ -1147,6 +1225,31 @@ class ABCompareDeck(QWidget):
         self.player_a.stop()
         self.player_b.stop()
 
+    def set_loop_start(self) -> None:
+        player = self._active_player()
+        if player is None:
+            return
+        self.loop_start_ms = player.position()
+        if self.loop_end_ms is not None and self.loop_end_ms <= self.loop_start_ms:
+            self.loop_end_ms = None
+        self._sync_loop_label()
+
+    def set_loop_end(self) -> None:
+        player = self._active_player()
+        if player is None:
+            return
+        position = player.position()
+        if self.loop_start_ms is not None and position <= self.loop_start_ms:
+            self.loop_end_ms = None
+        else:
+            self.loop_end_ms = position
+        self._sync_loop_label()
+
+    def clear_loop(self) -> None:
+        self.loop_start_ms = None
+        self.loop_end_ms = None
+        self._sync_loop_label()
+
     def switch_ab(self) -> None:
         current = self._active_player()
         next_key = "b" if self.active_key == "a" else "a"
@@ -1178,6 +1281,14 @@ class ABCompareDeck(QWidget):
             player.setPosition(position)
 
     def _on_position_changed(self, _position: int) -> None:
+        player = self._active_player()
+        if (
+            player is not None
+            and self.loop_start_ms is not None
+            and self.loop_end_ms is not None
+            and player.position() >= self.loop_end_ms
+        ):
+            player.setPosition(self.loop_start_ms)
         self._sync_timeline_from_active()
 
     def _on_duration_changed(self, _duration: int) -> None:
@@ -1206,6 +1317,9 @@ class ABCompareDeck(QWidget):
         self.play_button.setEnabled(player is not None)
         self.stop_button.setEnabled(has_any_source)
         self.switch_button.setEnabled(self.source_a is not None and self.source_b is not None)
+        self.loop_set_start_button.setEnabled(player is not None)
+        self.loop_set_end_button.setEnabled(player is not None)
+        self.loop_clear_button.setEnabled(self.loop_start_ms is not None or self.loop_end_ms is not None)
         active_source = "A" if self.active_key == "a" else "B"
         self.active_badge.setText(f"Active {active_source}")
         self.active_label.setText(
@@ -1216,6 +1330,20 @@ class ABCompareDeck(QWidget):
             self.play_button.setText("Pause")
         else:
             self.play_button.setText("Play")
+        self._sync_loop_label()
+
+    def _sync_loop_label(self) -> None:
+        if self.loop_start_ms is None and self.loop_end_ms is None:
+            self.loop_label.setText("Loop: off")
+            return
+        start_text = format_milliseconds(self.loop_start_ms or 0)
+        end_text = format_milliseconds(self.loop_end_ms or 0)
+        if self.loop_start_ms is not None and self.loop_end_ms is not None:
+            self.loop_label.setText(f"Loop: {start_text} -> {end_text}")
+        elif self.loop_start_ms is not None:
+            self.loop_label.setText(f"Loop in: {start_text} · set loop out")
+        else:
+            self.loop_label.setText(f"Loop out: {end_text} · set loop in")
 
 
 class SpectrogramView(QScrollArea):
@@ -1378,6 +1506,8 @@ class MainWindow(QMainWindow):
         self.analyze_worker: AnalyzeWorker | None = None
         self.run_worker: RunWorker | None = None
         self.export_worker: ExportWorker | None = None
+        self.active_run_started_at: float | None = None
+        self.active_run_backgrounded = False
 
         self.setWindowTitle(f"{APP_NAME} · PySide6")
         self.resize(1440, 900)
@@ -1527,6 +1657,15 @@ class MainWindow(QMainWindow):
         self.run_steps_list = QListWidget()
         progress_layout.addWidget(self.progress_label)
         progress_layout.addWidget(self.progress_bar)
+        progress_action_row = QHBoxLayout()
+        self.background_button = QPushButton("Run in Background")
+        self.background_button.clicked.connect(self.run_in_background)
+        self.cancel_run_button = QPushButton("Cancel Repair")
+        self.cancel_run_button.clicked.connect(self.cancel_active_run)
+        progress_action_row.addWidget(self.background_button)
+        progress_action_row.addWidget(self.cancel_run_button)
+        progress_action_row.addStretch(1)
+        progress_layout.addLayout(progress_action_row)
         progress_layout.addWidget(self.run_steps_list)
         bottom_split.addWidget(progress_box)
 
@@ -1544,12 +1683,15 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right_scroll)
         splitter.setSizes([320, 1200])
 
+        self.preset_combo.currentTextChanged.connect(self._sync_preset_text)
         self.intensity_combo.currentTextChanged.connect(self._sync_intensity_text)
+        self.gpu_checkbox.toggled.connect(lambda _checked: self._sync_repair_runtime_hint())
         self.issue_list.currentItemChanged.connect(self._show_issue_detail)
         self.stems_list.currentItemChanged.connect(self._show_stem_preview)
 
         self._apply_styles()
         self._sync_runtime_summary()
+        self._sync_preset_text(self.preset_combo.currentText())
         self._sync_intensity_text(self.intensity_combo.currentText())
 
     def _build_home_tab(self) -> None:
@@ -1701,12 +1843,30 @@ class MainWindow(QMainWindow):
         top_row = QHBoxLayout()
         self.start_cleanup_button = QPushButton("Start AI Song Cleanup")
         self.start_cleanup_button.clicked.connect(self.start_cleanup)
+        self.reset_recommended_button = QPushButton("Reset to Recommended")
+        self.reset_recommended_button.clicked.connect(self.reset_to_recommended)
         top_row.addWidget(self.start_cleanup_button)
+        top_row.addWidget(self.reset_recommended_button)
         top_row.addStretch(1)
         layout.addLayout(top_row)
 
         settings_split = QSplitter(Qt.Orientation.Horizontal)
         settings_split.setChildrenCollapsible(False)
+
+        preset_box = QGroupBox("Repair Path")
+        preset_layout = QVBoxLayout(preset_box)
+        self.repair_preset_title = QLabel("AI Song Cleanup")
+        self.repair_preset_title.setObjectName("sectionTitle")
+        self.repair_preset_description = QLabel("")
+        self.repair_preset_description.setWordWrap(True)
+        self.repair_runtime_hint = QLabel("Estimated runtime: -")
+        self.repair_runtime_hint.setObjectName("audioMeta")
+        preset_layout.addWidget(self.preset_combo)
+        preset_layout.addWidget(self.repair_preset_title)
+        preset_layout.addWidget(self.repair_preset_description)
+        preset_layout.addWidget(self.repair_runtime_hint)
+        preset_layout.addStretch(1)
+        settings_split.addWidget(preset_box)
 
         project_box = QGroupBox("Project")
         project_form = QFormLayout(project_box)
@@ -1736,7 +1896,7 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.finishing_checkbox)
         options_layout.addStretch(1)
         settings_split.addWidget(options_box)
-        settings_split.setSizes([280, 340, 280])
+        settings_split.setSizes([340, 280, 320, 280])
 
         layout.addWidget(settings_split)
 
@@ -1770,7 +1930,7 @@ class MainWindow(QMainWindow):
         self.compare_continue_button = QPushButton("Continue to Export")
         self.compare_continue_button.clicked.connect(lambda: self.tabs.setCurrentWidget(self.export_tab))
         self.compare_retry_button = QPushButton("Run Again with Different Settings")
-        self.compare_retry_button.clicked.connect(self.start_cleanup)
+        self.compare_retry_button.clicked.connect(self.try_another_repair)
         compare_header.addWidget(self.compare_continue_button)
         compare_header.addWidget(self.compare_retry_button)
         compare_header.addStretch(1)
@@ -2112,6 +2272,8 @@ class MainWindow(QMainWindow):
         self.analysis_upgrade_button.setDisabled(busy or not has_project)
         self.start_cleanup_button.setDisabled(busy or not has_project)
         self.export_confirm_button.setDisabled(busy or not has_run)
+        self.background_button.setDisabled(not busy or self.run_worker is None)
+        self.cancel_run_button.setDisabled(not busy or self.run_worker is None)
 
     def _sync_runtime_summary(self) -> None:
         runtime_label = "GPU Ready" if self.runtime["cuda_available"] else "CPU Only"
@@ -2125,6 +2287,33 @@ class MainWindow(QMainWindow):
 
     def _sync_intensity_text(self, intensity: str) -> None:
         self.repair_intensity_description.setText(intensity_description(intensity))
+        self._sync_repair_runtime_hint()
+
+    def _sync_preset_text(self, preset: str) -> None:
+        self.repair_preset_title.setText(preset.replace("_", " ").title())
+        self.repair_preset_description.setText(preset_description(preset))
+        self._sync_repair_runtime_hint()
+
+    def _sync_repair_runtime_hint(self) -> None:
+        report = (self.current_project_detail or {}).get("analysis_report") if self.current_project_detail else None
+        self.repair_runtime_hint.setText(
+            runtime_hint(report, self.preset_combo.currentText(), self.intensity_combo.currentText(), self.gpu_checkbox.isChecked())
+        )
+
+    def reset_to_recommended(self) -> None:
+        report = (self.current_project_detail or {}).get("analysis_report") if self.current_project_detail else None
+        if not report:
+            self.show_error("Run analysis first before resetting to the recommended repair.")
+            return
+        recommended_preset = report.get("recommended_preset") or DEFAULT_PRESET
+        suggested_intensity = report.get("suggested_intensity") or "medium"
+        if self.preset_combo.findText(recommended_preset) >= 0:
+            self.preset_combo.setCurrentText(recommended_preset)
+        if self.intensity_combo.findText(suggested_intensity) >= 0:
+            self.intensity_combo.setCurrentText(suggested_intensity)
+        self.finishing_checkbox.setChecked(False)
+        self.export_stems_checkbox.setChecked(False)
+        self.set_message("Repair settings reset to the current recommendation.")
 
     def refresh_projects(self) -> None:
         selected_id = self.current_project_id
@@ -2336,6 +2525,9 @@ class MainWindow(QMainWindow):
         self.repair_module_list.clear()
 
         if report:
+            recommended_preset = report.get("recommended_preset") or DEFAULT_PRESET
+            if self.preset_combo.findText(recommended_preset) >= 0:
+                self.preset_combo.setCurrentText(recommended_preset)
             if self.intensity_combo.findText(suggested) >= 0:
                 self.intensity_combo.setCurrentText(suggested)
             for issue in report.get("issues", []):
@@ -2351,6 +2543,7 @@ class MainWindow(QMainWindow):
                     self.repair_module_list.addItem(module)
         else:
             self.repair_issue_list.addItem("Run analysis first to unlock cleanup settings.")
+        self._sync_preset_text(self.preset_combo.currentText())
 
     def _render_compare(self, detail: dict) -> None:
         source_file = detail["source_file"]
@@ -2365,7 +2558,10 @@ class MainWindow(QMainWindow):
         self.compare_summary_label.setText(
             "\n\n".join(compare_summary_lines(analysis_report, run_detail.get("report") if run_detail else None))
         )
-        self.compare_feedback_label.setText("Listen to the same section on A and B, then record your verdict.")
+        saved_feedback = run_detail.get("run", {}).get("user_feedback") if run_detail else None
+        self.compare_feedback_label.setText(
+            f"Verdict recorded: {saved_feedback}" if saved_feedback else "Set a loop around the same phrase, switch between A and B, then record your verdict."
+        )
         original_spectrogram = (analysis_report or {}).get("spectrogram_path")
         repaired_spectrogram = None
         if run_detail:
@@ -2412,8 +2608,12 @@ class MainWindow(QMainWindow):
         self.compare_audio_card.set_source(preview_asset["path"] if preview_asset else None)
 
     def _record_compare_feedback(self, verdict: str) -> None:
+        if self.current_run_id:
+            self.db.set_run_feedback(self.current_run_id, verdict)
         self.compare_feedback_label.setText(f"Verdict recorded: {verdict}")
         self.log(f"Compare verdict: {verdict}")
+        if self.current_project_id:
+            self.load_project(self.current_project_id)
 
     def _show_stem_preview(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if current is None:
@@ -2460,18 +2660,27 @@ class MainWindow(QMainWindow):
         pipeline_lookup = pipeline_step_lookup(self.current_run_detail.get("report"))
         if steps:
             last_step = steps[-1]
-            self.progress_label.setText(
-                f"{last_step['step_name']} · {last_step['status']}"
-            )
+            progress_title = pipeline_step_label(pipeline_lookup.get(last_step["step_name"], {}))
             progress = int((len([step for step in steps if step['status'] == 'completed']) / max(len(steps), 1)) * 100)
             self.progress_bar.setValue(progress)
+            eta_suffix = ""
+            if self.active_run_started_at and progress > 0 and progress < 100:
+                elapsed = max(0.0, time.time() - self.active_run_started_at)
+                eta_seconds = int((elapsed / max(progress, 1)) * (100 - progress))
+                eta_suffix = f" · ETA {format_milliseconds(eta_seconds * 1000)}"
+            self.progress_label.setText(f"{progress_title} · {last_step['status']}{eta_suffix}")
         else:
             self.progress_label.setText(run["status"])
             self.progress_bar.setValue(0)
 
         for step in steps:
             planned_step = pipeline_lookup.get(step["step_name"], {})
-            line = f"{pipeline_step_label(planned_step) if planned_step else step['step_name']} · {step['status']}"
+            state_icon = {
+                "completed": "[x]",
+                "running": "[>]",
+                "failed": "[!]",
+            }.get(step["status"], "[ ]")
+            line = f"{state_icon} {pipeline_step_label(planned_step) if planned_step else step['step_name']} · {step['status']}"
             self.run_steps_list.addItem(line)
             for module_line in pipeline_module_lines(planned_step):
                 self.run_steps_list.addItem(f"  {module_line}")
@@ -2540,6 +2749,8 @@ class MainWindow(QMainWindow):
         self.set_message("Starting cleanup run...")
         self.progress_label.setText("Starting cleanup")
         self.progress_bar.setValue(0)
+        self.active_run_started_at = time.time()
+        self.active_run_backgrounded = False
         self.log(f"Starting cleanup for {self.current_project_id}")
         self.run_worker = RunWorker(
             self.db,
@@ -2553,17 +2764,34 @@ class MainWindow(QMainWindow):
         )
         self.run_worker.progress.connect(self._run_progress)
         self.run_worker.finished_ok.connect(self._run_finished)
+        self.run_worker.cancelled.connect(self._run_cancelled)
         self.run_worker.failed.connect(self._worker_failed)
         self.run_worker.start()
 
     def _run_progress(self, step: str, status: str, message: str, progress: float) -> None:
-        self.progress_label.setText(f"{step} · {status} · {message}")
+        plain_labels = {
+            "normalize": "Preparing audio",
+            "separate_stems": "Separating stems",
+            "repair_vocals": "Repairing vocals",
+            "repair_music": "Repairing music",
+            "reconstruct_mix": "Rebuilding mix",
+        }
+        title = plain_labels.get(step, step)
+        eta_suffix = ""
+        percent = int(progress * 100)
+        if self.active_run_started_at and percent > 0 and percent < 100:
+            elapsed = max(0.0, time.time() - self.active_run_started_at)
+            eta_seconds = int((elapsed / max(percent, 1)) * (100 - percent))
+            eta_suffix = f" · ETA {format_milliseconds(eta_seconds * 1000)}"
+        self.progress_label.setText(f"{title} · {status}{eta_suffix}")
         self.progress_bar.setValue(int(progress * 100))
         self.log(f"{step}: {message}")
-        self.run_steps_list.addItem(f"{step} · {status} · {message}")
+        self.set_message(message)
 
     def _run_finished(self, run_id: str) -> None:
         self.current_run_id = run_id
+        self.active_run_started_at = None
+        self.active_run_backgrounded = False
         self.progress_label.setText("Cleanup completed")
         self.progress_bar.setValue(100)
         self.set_message(f"Run {run_id} completed.")
@@ -2572,6 +2800,27 @@ class MainWindow(QMainWindow):
         if self.current_project_id:
             self.load_project(self.current_project_id)
         self.tabs.setCurrentWidget(self.compare_tab)
+
+    def _run_cancelled(self, run_id: str) -> None:
+        self.current_run_id = run_id
+        self.active_run_started_at = None
+        self.active_run_backgrounded = False
+        self.progress_label.setText("Cleanup cancelled")
+        self.progress_bar.setValue(0)
+        self.set_message(None)
+        self.set_error("Cleanup cancelled by user.")
+        self.log(f"Cleanup cancelled for run {run_id}")
+        self.set_busy(False)
+        if self.current_project_id:
+            self.load_project(self.current_project_id)
+
+    def try_another_repair(self) -> None:
+        if not self.current_project_detail or not self.current_project_detail.get("analysis_report"):
+            self.show_error("Run analysis first before trying another repair.")
+            return
+        self.set_error(None)
+        self.set_message("Adjust the repair settings, then start another cleanup run.")
+        self.tabs.setCurrentWidget(self.repair_tab)
 
     def export_audio(self) -> None:
         if not self.current_project_id or not self.current_run_id:
@@ -2604,6 +2853,8 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.export_tab)
 
     def _worker_failed(self, message: str) -> None:
+        self.active_run_started_at = None
+        self.active_run_backgrounded = False
         self.progress_label.setText("Operation failed")
         self.progress_bar.setValue(0)
         self.set_message(None)
@@ -2613,6 +2864,21 @@ class MainWindow(QMainWindow):
         self.show_error(message)
         if self.current_project_id:
             self.load_project(self.current_project_id)
+
+    def run_in_background(self) -> None:
+        if self.run_worker is None or not self.run_worker.isRunning():
+            return
+        self.active_run_backgrounded = True
+        self.set_message("Cleanup continues in the background while you review other screens.")
+        self.log("Cleanup moved to background")
+        self.tabs.setCurrentWidget(self.home_tab)
+
+    def cancel_active_run(self) -> None:
+        if self.run_worker is None or not self.run_worker.isRunning():
+            return
+        self.set_message("Cancelling cleanup run...")
+        self.log("Cancelling active cleanup run")
+        self.run_worker.cancel()
 
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, APP_NAME, message)
