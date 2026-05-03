@@ -43,12 +43,17 @@ ISSUE_STRATEGIES: dict[str, dict[str, str]] = {
     "noise_floor": {
         "title": "Raised Noise Floor",
         "detection": "Detected from unusually elevated quiet passages relative to the program level.",
-        "repair": "Use conditional vocal denoising only when the noise-floor flag is present.",
+        "repair": "Use a conservative vocal denoise pass that only attenuates near-floor residue without aggressively stripping the body of the signal.",
     },
     "room_smear": {
         "title": "Room Smear / Baked-In Reverb",
         "detection": "Detected from softened transient definition combined with persistent low-mid buildup.",
-        "repair": "Use only light clarity compensation now; a real de-reverb path remains a later dedicated module.",
+        "repair": "Use a conservative de-smear pass that slightly reins in smeared sustain and restores transient definition without pretending to be full de-reverb.",
+    },
+    "stereo_instability": {
+        "title": "Stereo Instability",
+        "detection": "Detected from weak left-right correlation and an unusually unstable side component over time.",
+        "repair": "Apply conservative stereo stabilization during reconstruction to reduce wandering width without collapsing the mix to mono.",
     },
     "general_cleanup": {
         "title": "General Cleanup",
@@ -393,6 +398,62 @@ def compute_transient_flatness(audio: np.ndarray, sample_rate: int) -> float | N
     return float(np.percentile(energies, 95) / mean_energy)
 
 
+def compute_stereo_instability(audio_path: Path, sample_rate: int) -> tuple[float | None, float | None, float | None]:
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(audio_path),
+        "-f",
+        "f32le",
+        "-ac",
+        "2",
+        "-acodec",
+        "pcm_f32le",
+        "-ar",
+        str(sample_rate),
+        "-",
+    ]
+
+    completed = subprocess.run(command, capture_output=True)
+    if completed.returncode != 0:
+        return None, None, None
+
+    stereo = np.frombuffer(completed.stdout, dtype=np.float32).copy()
+    if stereo.size < 4096 * 2:
+        return None, None, None
+
+    stereo = stereo.reshape(-1, 2)
+    left = stereo[:, 0]
+    right = stereo[:, 1]
+    correlation = float(np.corrcoef(left, right)[0, 1]) if np.std(left) > 1e-6 and np.std(right) > 1e-6 else None
+
+    mid = 0.5 * (left + right)
+    side = 0.5 * (left - right)
+    mid_rms = float(np.sqrt(np.mean(np.square(mid)) + 1e-12))
+    side_rms = float(np.sqrt(np.mean(np.square(side)) + 1e-12))
+    side_ratio = side_rms / max(mid_rms, 1e-6)
+
+    frame_size = 4096
+    hop = 2048
+    if stereo.shape[0] < frame_size + hop:
+        return correlation, side_ratio, None
+
+    frame_count = 1 + (stereo.shape[0] - frame_size) // hop
+    side_levels = np.empty(frame_count, dtype=np.float32)
+    for frame_index in range(frame_count):
+        start = frame_index * hop
+        frame_side = side[start : start + frame_size]
+        side_levels[frame_index] = float(np.sqrt(np.mean(np.square(frame_side)) + 1e-12))
+
+    mean_side = float(np.mean(side_levels))
+    if mean_side <= 1e-9:
+        return correlation, side_ratio, None
+
+    side_variation = float(np.std(side_levels) / mean_side)
+    return correlation, side_ratio, side_variation
+
+
 def write_audio_stereo(path: Path, audio: np.ndarray) -> None:
     write_audio_stereo_with_rate(path, audio, 48000)
 
@@ -433,6 +494,134 @@ def normalize_peak(audio: np.ndarray, target_peak: float = 0.95) -> np.ndarray:
     return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
 
+def compute_mix_metrics(path: Path) -> dict:
+    audio, sample_rate = load_audio_stereo(path)
+    mono = np.mean(audio, axis=1)
+    peak = float(np.max(np.abs(audio)))
+    rms = float(np.sqrt(np.mean(np.square(audio)) + 1e-12))
+    crest_factor = peak / max(rms, 1e-6)
+
+    window = mono[: min(mono.shape[0], sample_rate * 10)]
+    if window.size < 1024:
+        spectral_centroid_hz = None
+        high_band_ratio = None
+        harsh_band_ratio = None
+    else:
+        spectrum = np.abs(np.fft.rfft(window * np.hanning(window.shape[0])))
+        freqs = np.fft.rfftfreq(window.shape[0], 1.0 / sample_rate)
+        total_energy = float(np.sum(spectrum) + 1e-12)
+        spectral_centroid_hz = float(np.sum(freqs * spectrum) / total_energy)
+        high_band_ratio = float(np.sum(spectrum[freqs >= 12000]) / total_energy)
+        harsh_band_ratio = float(np.sum(spectrum[(freqs >= 6000) & (freqs <= 10000)]) / total_energy)
+
+    left = audio[:, 0]
+    right = audio[:, 1]
+    stereo_correlation = float(np.corrcoef(left, right)[0, 1]) if np.std(left) > 1e-6 and np.std(right) > 1e-6 else None
+
+    return {
+        "peak": round(peak, 4),
+        "rms": round(rms, 4),
+        "crest_factor": round(crest_factor, 3),
+        "spectral_centroid_hz": round(spectral_centroid_hz, 2) if spectral_centroid_hz is not None else None,
+        "high_band_ratio": round(high_band_ratio, 4) if high_band_ratio is not None else None,
+        "harsh_band_ratio": round(harsh_band_ratio, 4) if harsh_band_ratio is not None else None,
+        "stereo_correlation": round(stereo_correlation, 4) if stereo_correlation is not None else None,
+    }
+
+
+def compute_metric_deltas(before_metrics: dict, after_metrics: dict) -> dict:
+    deltas: dict[str, float] = {}
+    for key in before_metrics:
+        before_value = before_metrics.get(key)
+        after_value = after_metrics.get(key)
+        if isinstance(before_value, (int, float)) and isinstance(after_value, (int, float)):
+            deltas[key] = round(float(after_value) - float(before_value), 4)
+    return deltas
+
+
+def smooth_signal(signal: np.ndarray, window_size: int) -> np.ndarray:
+    if window_size <= 1 or signal.size < window_size:
+        return signal.astype(np.float32)
+    kernel = np.ones(window_size, dtype=np.float32) / float(window_size)
+    return np.convolve(signal.astype(np.float32), kernel, mode="same")
+
+
+def apply_vocal_naturalization(audio: np.ndarray, sample_rate: int, intensity: str) -> np.ndarray:
+    if audio.ndim != 2 or audio.shape[1] != 2 or audio.shape[0] < 2048:
+        return audio
+
+    scale = intensity_scale(intensity)
+    mono = np.mean(audio, axis=1)
+    envelope = smooth_signal(np.abs(mono), max(64, sample_rate // 180))
+    envelope = envelope / max(float(np.max(envelope)), 1e-6)
+
+    time_axis = np.arange(audio.shape[0], dtype=np.float32) / float(sample_rate)
+    modulation_hz = 4.2 + (0.5 * min(scale, 1.4))
+    modulation_depth = 0.0035 * scale
+    modulation = 1.0 + (modulation_depth * envelope * np.sin(2.0 * np.pi * modulation_hz * time_axis))
+
+    # Use low-level shaped masking to soften quantized vocal edges without making
+    # the result hissy. The noise is deterministic so repeated runs stay stable.
+    rng = np.random.default_rng(42)
+    raw_noise = rng.standard_normal(audio.shape[0]).astype(np.float32)
+    shaped_noise = smooth_signal(raw_noise, max(16, sample_rate // 12000)) - smooth_signal(
+        raw_noise, max(128, sample_rate // 1800)
+    )
+    shaped_noise = shaped_noise / max(float(np.max(np.abs(shaped_noise))), 1e-6)
+    noise_level = 0.0012 * scale
+    masking = (noise_level * envelope * shaped_noise)[:, None]
+
+    naturalized = (audio * modulation[:, None]) + masking
+    return normalize_peak(naturalized, target_peak=0.98)
+
+
+def apply_conservative_vocal_denoise(audio: np.ndarray, sample_rate: int, intensity: str) -> np.ndarray:
+    if audio.ndim != 2 or audio.shape[1] != 2 or audio.shape[0] < 2048:
+        return audio
+
+    scale = intensity_scale(intensity)
+    mono = np.mean(audio, axis=1)
+    envelope = smooth_signal(np.abs(mono), max(96, sample_rate // 120))
+    peak_envelope = max(float(np.max(envelope)), 1e-6)
+    normalized_envelope = envelope / peak_envelope
+
+    noise_floor = float(np.percentile(envelope, 18))
+    gate_floor = min(0.22, max(0.04, (noise_floor / peak_envelope) * (1.1 + 0.05 * scale)))
+    gate_ceiling = min(0.42, gate_floor + 0.12)
+    max_reduction = 0.16 + (0.05 * min(scale, 1.35))
+
+    reduction_curve = np.clip((gate_ceiling - normalized_envelope) / max(gate_ceiling - gate_floor, 1e-6), 0.0, 1.0)
+    reduction_curve = smooth_signal(reduction_curve.astype(np.float32), max(64, sample_rate // 200))
+    gain = 1.0 - (max_reduction * reduction_curve)
+
+    denoised = audio * gain[:, None]
+    return denoised.astype(np.float32)
+
+
+def apply_conservative_desmear(audio: np.ndarray, sample_rate: int, intensity: str) -> np.ndarray:
+    if audio.ndim != 2 or audio.shape[1] != 2 or audio.shape[0] < 4096:
+        return audio
+
+    scale = intensity_scale(intensity)
+    mono = np.mean(audio, axis=1)
+    abs_mono = np.abs(mono)
+    fast_env = smooth_signal(abs_mono, max(24, sample_rate // 2000))
+    slow_env = smooth_signal(abs_mono, max(256, sample_rate // 120))
+    transient_focus = np.clip(fast_env - slow_env, 0.0, None)
+    transient_focus = transient_focus / max(float(np.max(transient_focus)), 1e-6)
+
+    sustain_reduction = 0.08 + (0.03 * min(scale, 1.35))
+    gain = 1.0 - (sustain_reduction * (1.0 - transient_focus))
+    gain = smooth_signal(gain.astype(np.float32), max(48, sample_rate // 1000))
+
+    highpassed = np.zeros_like(audio)
+    highpassed[1:] = audio[1:] - (0.985 * audio[:-1])
+    transient_lift = (0.05 + (0.015 * min(scale, 1.35))) * transient_focus[:, None] * highpassed
+
+    clarified = (audio * gain[:, None]) + transient_lift
+    return normalize_peak(clarified, target_peak=0.98)
+
+
 def compute_analysis(normalized_path: Path) -> dict:
     audio, sample_rate = load_audio_for_analysis(normalized_path)
     if audio.size == 0:
@@ -464,6 +653,7 @@ def compute_analysis(normalized_path: Path) -> dict:
     vocal_presence_variation = compute_spectral_variation(audio, sample_rate, 2000.0, 6000.0)
     vocal_artifact_variation = compute_spectral_variation(audio, sample_rate, 6000.0, 10000.0)
     transient_flatness = compute_transient_flatness(audio, sample_rate)
+    stereo_correlation, stereo_side_ratio, stereo_side_variation = compute_stereo_instability(normalized_path, sample_rate)
 
     issues: list[dict] = []
 
@@ -550,6 +740,25 @@ def compute_analysis(normalized_path: Path) -> dict:
             0.5 + min(0.25, (noise_floor_ratio - 0.22) * 1.5),
         )
 
+    if (
+        stereo_correlation is not None
+        and stereo_side_ratio is not None
+        and stereo_side_variation is not None
+        and stereo_correlation < 0.35
+        and stereo_side_ratio > 0.45
+        and stereo_side_variation > 0.38
+    ):
+        add_issue(
+            "stereo_instability",
+            "Stereo instability",
+            "medium",
+            "The left/right image looks unusually unstable over time, which can sound phasey or unfocused.",
+            0.52
+            + min(0.18, (0.35 - stereo_correlation) * 0.4)
+            + min(0.14, (stereo_side_ratio - 0.45) * 0.35)
+            + min(0.14, (stereo_side_variation - 0.38) * 0.6),
+        )
+
     if not issues:
         add_issue(
             "general_cleanup",
@@ -597,6 +806,9 @@ def compute_analysis(normalized_path: Path) -> dict:
         "vocal_presence_variation": round(vocal_presence_variation, 4) if vocal_presence_variation is not None else None,
         "vocal_artifact_variation": round(vocal_artifact_variation, 4) if vocal_artifact_variation is not None else None,
         "transient_flatness": round(transient_flatness, 4) if transient_flatness is not None else None,
+        "stereo_correlation": round(stereo_correlation, 4) if stereo_correlation is not None else None,
+        "stereo_side_ratio": round(stereo_side_ratio, 4) if stereo_side_ratio is not None else None,
+        "stereo_side_variation": round(stereo_side_variation, 4) if stereo_side_variation is not None else None,
         "overall_confidence": round(float(np.mean([issue["confidence"] for issue in issues])), 2),
         "issues": issues,
         "suggested_intensity": suggested_intensity,
@@ -634,6 +846,185 @@ def analyze_project(input_path: Path, normalized_path: Path, analysis_path: Path
     analysis["spectrogram_path"] = str(spectrogram_path)
     write_analysis_report(analysis_path, project_id, analysis)
     return 0
+
+
+def build_pipeline_plan(analysis: dict, payload: dict) -> dict:
+    issue_ids = {issue["id"] for issue in analysis["issues"]}
+    intensity = str(payload.get("options", {}).get("intensity", "medium"))
+    apply_light_finishing = bool(payload.get("options", {}).get("apply_light_finishing", False))
+    export_stems = bool(payload.get("options", {}).get("export_stems", False))
+    gpu_enabled = bool(payload.get("options", {}).get("gpu_enabled", True))
+
+    vocal_modules: list[dict[str, str]] = []
+    music_modules: list[dict[str, str]] = []
+    mix_modules: list[dict[str, str]] = []
+
+    if "robotic_vocals" in issue_ids:
+        vocal_modules.append(
+            {
+                "id": "vocal_naturalization",
+                "label": "Vocal Naturalization",
+                "reason": "Combines conservative vocal shaping with subtle micro-modulation and low-level masking to reduce robotic vocal behavior.",
+            }
+        )
+    if "metallic_highs" in issue_ids:
+        vocal_modules.append(
+            {
+                "id": "vocal_deesser",
+                "label": "Vocal De-Esser / Harshness Reduction",
+                "reason": "Targets metallic high-frequency harshness in the vocal stem.",
+            }
+        )
+        music_modules.append(
+            {
+                "id": "music_harshness_reduction",
+                "label": "Music Harshness Reduction",
+                "reason": "Reduces metallic upper-band buildup in the backing stem.",
+            }
+        )
+    if "dull_top_end" in issue_ids:
+        vocal_modules.append(
+            {
+                "id": "vocal_brightness_restore",
+                "label": "Vocal Brightness Restore",
+                "reason": "Gently restores missing top-end on the vocal stem.",
+            }
+        )
+        music_modules.append(
+            {
+                "id": "music_brightness_restore",
+                "label": "Music Brightness Restore",
+                "reason": "Gently restores missing top-end on the music stem.",
+            }
+        )
+    if "codec_haze" in issue_ids:
+        music_modules.append(
+            {
+                "id": "low_mid_cleanup",
+                "label": "Low-Mid Cleanup",
+                "reason": "Reduces hazy low-mid buildup before reconstruction.",
+            }
+        )
+    if "room_smear" in issue_ids:
+        vocal_modules.append(
+            {
+                "id": "vocal_desmear",
+                "label": "Vocal De-Smear",
+                "reason": "Tightens smeared vocal sustain and restores some transient focus without forcing an artificial dry sound.",
+            }
+        )
+        music_modules.append(
+            {
+                "id": "music_desmear",
+                "label": "Music De-Smear",
+                "reason": "Applies conservative transient-focused cleanup to reduce washed-out sustain in the backing stem.",
+            }
+        )
+    if "congested_mix" in issue_ids:
+        vocal_modules.append(
+            {
+                "id": "vocal_dynamic_control",
+                "label": "Vocal Dynamic Control",
+                "reason": "Gently controls vocal density before rebuild.",
+            }
+        )
+        music_modules.append(
+            {
+                "id": "music_dynamic_control",
+                "label": "Music Dynamic Control",
+                "reason": "Gently controls music density before rebuild.",
+            }
+        )
+    if "stereo_instability" in issue_ids:
+        mix_modules.append(
+            {
+                "id": "stereo_stabilization",
+                "label": "Stereo Stabilization",
+                "reason": "Reduces unstable side-energy swings during mix reconstruction while preserving stereo width.",
+            }
+        )
+    if "noise_floor" in issue_ids:
+        vocal_modules.append(
+            {
+                "id": "conservative_vocal_denoise",
+                "label": "Conservative Vocal Denoise",
+                "reason": "Attenuates only the lowest-level vocal residue so hiss and background buildup are reduced without hollowing out the stem.",
+            }
+        )
+    if not vocal_modules:
+        vocal_modules.append(
+            {
+                "id": "vocal_conservative_cleanup",
+                "label": "Conservative Vocal Cleanup",
+                "reason": "No dominant vocal issue detected, so the path stays gentle.",
+            }
+        )
+    if not music_modules:
+        music_modules.append(
+            {
+                "id": "music_conservative_cleanup",
+                "label": "Conservative Music Cleanup",
+                "reason": "No dominant music issue detected, so the path stays gentle.",
+            }
+        )
+
+    mix_modules.append(
+        {
+            "id": "reconstruct_mix",
+            "label": "Mix Reconstruction",
+            "reason": "Rebuilds the stereo mix from repaired stems.",
+        }
+    )
+    mix_modules.append(
+        {
+            "id": "export_limited_preview",
+            "label": "Preview / Export Rendering",
+            "reason": "Creates compare-ready preview and export-safe output.",
+        }
+    )
+    if apply_light_finishing:
+        mix_modules.append(
+            {
+                "id": "light_finishing_placeholder",
+                "label": "Light Finishing",
+                "reason": "User requested optional finishing, reserved for the dedicated finishing path.",
+            }
+        )
+
+    return {
+        "preset": payload.get("preset", "ai_song_cleanup"),
+        "intensity": intensity,
+        "gpu_enabled": gpu_enabled,
+        "export_stems": export_stems,
+        "apply_light_finishing": apply_light_finishing,
+        "steps": [
+            {
+                "id": "normalize",
+                "label": "Prepare Audio",
+                "modules": [
+                    {
+                        "id": "normalize_audio",
+                        "label": "Normalize Working File",
+                        "reason": "Creates the stable working file for analysis and repair.",
+                    }
+                ],
+            },
+            {
+                "id": "separate_stems",
+                "label": "Separate Stems",
+                "modules": [
+                    {
+                        "id": "demucs_htdemucs",
+                        "label": "Demucs Stem Separation",
+                        "reason": "Separates vocals and backing audio before repair.",
+                    }
+                ],
+            },
+            {"id": "repair_vocals", "label": "Repair Vocals", "modules": vocal_modules},
+            {"id": "repair_music", "label": "Repair Music", "modules": music_modules},
+            {"id": "reconstruct_mix", "label": "Rebuild And Export", "modules": mix_modules},
+        ],
+    }
 
 
 def build_filter_chain(analysis: dict) -> str:
@@ -775,50 +1166,6 @@ def split_stems(normalized_path: Path, vocals_path: Path, music_path: Path, gpu_
     write_audio_stereo_with_rate(music_path, normalize_peak(music), model.samplerate)
 
 
-def denoise_vocals_with_deepfilternet(
-    vocals_path: Path,
-    output_path: Path,
-    gpu_enabled: bool,
-) -> None:
-    if importlib.util.find_spec("df") is None:
-        raise RuntimeError(
-            "DeepFilterNet is not installed. Install engine dependencies with `python -m pip install -r engine/requirements.txt`."
-        )
-
-    import torch
-
-    from df.enhance import enhance as df_enhance
-    from df.enhance import init_df
-
-    model, df_state, _suffix = init_df(default_model="DeepFilterNet3")
-    df_sample_rate = df_state.sr()
-    prepared_vocals_path = vocals_path
-
-    if df_sample_rate != 44100:
-        prepared_vocals_path = output_path.parent / "vocals_for_df.wav"
-        resample_audio_file(vocals_path, prepared_vocals_path, df_sample_rate)
-
-    audio = load_audio(prepared_vocals_path, df_sample_rate, 2)
-    waveform = torch.from_numpy(audio.T.copy()).float()
-    enhanced = df_enhance(
-        model,
-        df_state,
-        waveform,
-        pad=True,
-        atten_lim_db=6.0,
-    )
-    enhanced_audio = enhanced.detach().cpu().numpy().T
-    enhanced_path = output_path
-
-    if df_sample_rate != 44100:
-        enhanced_path = output_path.parent / "vocals_denoised_df_48k.wav"
-
-    write_audio_stereo_with_rate(enhanced_path, enhanced_audio, df_sample_rate)
-
-    if enhanced_path != output_path:
-        resample_audio_file(enhanced_path, output_path, 44100)
-
-
 def repair_vocals(
     vocals_path: Path,
     repaired_vocals_path: Path,
@@ -826,19 +1173,32 @@ def repair_vocals(
     intensity: str,
     gpu_enabled: bool,
 ) -> None:
-    issue_ids = {issue["id"] for issue in analysis["issues"]}
-    filtered_input_path = vocals_path
-
-    if "noise_floor" in issue_ids:
-        denoised_vocals_path = repaired_vocals_path.parent / "vocals_denoised.wav"
-        denoise_vocals_with_deepfilternet(vocals_path, denoised_vocals_path, gpu_enabled)
-        filtered_input_path = denoised_vocals_path
-
     filter_chain = build_vocal_filter_chain(analysis, intensity)
-    run_ffmpeg_filter(filtered_input_path, repaired_vocals_path, filter_chain)
+    run_ffmpeg_filter(vocals_path, repaired_vocals_path, filter_chain)
+
+    issue_ids = {issue["id"] for issue in analysis["issues"]}
+    if "robotic_vocals" in issue_ids or "noise_floor" in issue_ids or "room_smear" in issue_ids:
+        repaired_audio, sample_rate = load_audio_stereo(repaired_vocals_path)
+        if "robotic_vocals" in issue_ids:
+            repaired_audio = apply_vocal_naturalization(repaired_audio, sample_rate, intensity)
+        if "noise_floor" in issue_ids:
+            repaired_audio = apply_conservative_vocal_denoise(repaired_audio, sample_rate, intensity)
+        if "room_smear" in issue_ids:
+            repaired_audio = apply_conservative_desmear(repaired_audio, sample_rate, intensity)
+        write_audio_stereo_with_rate(repaired_vocals_path, repaired_audio, sample_rate)
 
 
-def reconstruct_mix(vocals_path: Path, music_path: Path, preview_path: Path) -> None:
+def repair_music(music_path: Path, repaired_music_path: Path, analysis: dict, intensity: str) -> None:
+    run_ffmpeg_filter(music_path, repaired_music_path, build_music_filter_chain(analysis, intensity))
+
+    issue_ids = {issue["id"] for issue in analysis["issues"]}
+    if "room_smear" in issue_ids:
+        repaired_audio, sample_rate = load_audio_stereo(repaired_music_path)
+        repaired_audio = apply_conservative_desmear(repaired_audio, sample_rate, intensity)
+        write_audio_stereo_with_rate(repaired_music_path, repaired_audio, sample_rate)
+
+
+def reconstruct_mix(vocals_path: Path, music_path: Path, preview_path: Path, analysis: dict) -> None:
     vocals, _sample_rate = load_audio_stereo(vocals_path)
     music, _sample_rate = load_audio_stereo(music_path)
 
@@ -853,7 +1213,52 @@ def reconstruct_mix(vocals_path: Path, music_path: Path, preview_path: Path) -> 
         return padded
 
     mix = pad(vocals) + pad(music)
+    issue_ids = {issue["id"] for issue in analysis["issues"]}
+    if "stereo_instability" in issue_ids:
+        mix = stabilize_stereo_image(mix)
     write_audio_stereo(preview_path, normalize_peak(mix))
+
+
+def stabilize_stereo_image(audio: np.ndarray) -> np.ndarray:
+    if audio.ndim != 2 or audio.shape[1] != 2 or audio.shape[0] < 2048:
+        return audio
+
+    left = audio[:, 0]
+    right = audio[:, 1]
+    mid = 0.5 * (left + right)
+    side = 0.5 * (left - right)
+
+    mid_rms = float(np.sqrt(np.mean(np.square(mid)) + 1e-12))
+    side_rms = float(np.sqrt(np.mean(np.square(side)) + 1e-12))
+    side_ratio = side_rms / max(mid_rms, 1e-6)
+    if side_ratio < 0.38:
+        return audio
+
+    frame_size = 4096
+    hop = 2048
+    if audio.shape[0] < frame_size + hop:
+        stabilized_side = side * 0.88
+    else:
+        frame_count = 1 + (audio.shape[0] - frame_size) // hop
+        side_levels = np.empty(frame_count, dtype=np.float32)
+        for frame_index in range(frame_count):
+            start = frame_index * hop
+            frame_side = side[start : start + frame_size]
+            side_levels[frame_index] = float(np.sqrt(np.mean(np.square(frame_side)) + 1e-12))
+
+        smoothed_levels = np.convolve(side_levels, np.ones(5, dtype=np.float32) / 5.0, mode="same")
+        gain_envelope = np.ones(audio.shape[0], dtype=np.float32)
+        for frame_index in range(frame_count):
+            start = frame_index * hop
+            end = min(start + frame_size, audio.shape[0])
+            raw_level = side_levels[frame_index]
+            target_level = max(smoothed_levels[frame_index], 1e-6)
+            gain = min(1.0, max(0.78, target_level / max(raw_level, 1e-6)))
+            gain_envelope[start:end] = np.minimum(gain_envelope[start:end], gain)
+        stabilized_side = side * gain_envelope
+
+    stabilized = np.column_stack((mid + stabilized_side, mid - stabilized_side)).astype(np.float32)
+    return stabilized
 
 
 def run_ffmpeg_filter(input_path: Path, output_path: Path, filter_chain: str) -> None:
@@ -928,12 +1333,17 @@ def write_report(
     normalized_path: Path,
     analysis_path: Path,
     analysis: dict,
+    pipeline_plan: dict,
     vocals_path: Path,
     music_path: Path,
     repaired_vocals_path: Path,
     repaired_music_path: Path,
     preview_path: Path,
+    repaired_spectrogram_path: Path,
     export_path: Path,
+    before_metrics: dict,
+    after_metrics: dict,
+    metric_deltas: dict,
 ) -> None:
     report = {
         "project_id": payload["project_id"],
@@ -941,13 +1351,20 @@ def write_report(
         "preset": payload["preset"],
         "normalized_path": str(normalized_path),
         "analysis_report_path": str(analysis_path),
+        "pipeline_plan": pipeline_plan,
         "recommended_preset": analysis["recommended_preset"],
         "vocals_path": str(vocals_path),
         "music_path": str(music_path),
         "repaired_vocals_path": str(repaired_vocals_path),
         "repaired_music_path": str(repaired_music_path),
         "preview_path": str(preview_path),
+        "repaired_spectrogram_path": str(repaired_spectrogram_path),
         "export_path": str(export_path),
+        "metrics": {
+            "before": before_metrics,
+            "after": after_metrics,
+            "delta": metric_deltas,
+        },
         "status": "completed",
     }
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -970,9 +1387,14 @@ def run(payload_path: Path) -> int:
     repaired_vocals_path = stems_dir / "vocals_repaired.wav"
     repaired_music_path = stems_dir / "music_repaired.wav"
     preview_path = run_dir / "previews" / "mix_preview.wav"
+    repaired_spectrogram_path = run_dir / "previews" / "mix_preview_spectrogram.png"
     export_path = run_dir / "exports" / "song_cleaned.wav"
     report_path = run_dir / "run-report.json"
     analysis: dict | None = None
+    pipeline_plan: dict | None = payload.get("pipeline_plan")
+    before_metrics: dict | None = None
+    after_metrics: dict | None = None
+    metric_deltas: dict | None = None
 
     steps = [
         ("normalize", "Preparing and normalizing audio"),
@@ -986,6 +1408,9 @@ def run(payload_path: Path) -> int:
         analysis = load_analysis_report(Path(analysis_report_path))
     elif analysis_path.exists():
         analysis = load_analysis_report(analysis_path)
+
+    if analysis is not None and pipeline_plan is None:
+        pipeline_plan = build_pipeline_plan(analysis, payload)
 
     for index, (step, message) in enumerate(steps, start=1):
         emit(
@@ -1022,10 +1447,14 @@ def run(payload_path: Path) -> int:
             if analysis is None:
                 raise RuntimeError("Analysis must exist before music repair")
 
-            run_ffmpeg_filter(music_path, repaired_music_path, build_music_filter_chain(analysis, intensity))
+            repair_music(music_path, repaired_music_path, analysis, intensity)
         elif step == "reconstruct_mix":
-            reconstruct_mix(repaired_vocals_path, repaired_music_path, preview_path)
+            reconstruct_mix(repaired_vocals_path, repaired_music_path, preview_path, analysis)
+            generate_spectrogram_image(preview_path, repaired_spectrogram_path)
             export_cleaned_mix(preview_path, export_path)
+            before_metrics = compute_mix_metrics(normalized_path)
+            after_metrics = compute_mix_metrics(preview_path)
+            metric_deltas = compute_metric_deltas(before_metrics, after_metrics)
 
         emit(
             {
@@ -1041,6 +1470,10 @@ def run(payload_path: Path) -> int:
 
     if analysis is None:
         raise RuntimeError("Analysis is required before cleanup. Run project analysis first.")
+    if pipeline_plan is None:
+        raise RuntimeError("Pipeline plan could not be created for this run.")
+    if before_metrics is None or after_metrics is None or metric_deltas is None:
+        raise RuntimeError("Run metrics could not be generated for this cleanup run.")
 
     write_report(
         report_path,
@@ -1048,12 +1481,17 @@ def run(payload_path: Path) -> int:
         normalized_path,
         analysis_path,
         analysis,
+        pipeline_plan,
         vocals_path,
         music_path,
         repaired_vocals_path,
         repaired_music_path,
         preview_path,
+        repaired_spectrogram_path,
         export_path,
+        before_metrics,
+        after_metrics,
+        metric_deltas,
     )
 
     emit(
