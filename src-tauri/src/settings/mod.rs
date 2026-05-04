@@ -37,11 +37,13 @@ impl AppSettings {
 
         std::fs::create_dir_all(&storage_dir)?;
 
+        let python_command = resolve_python_command(&workspace_dir);
+
         Ok(Self {
             storage_dir,
             database_path,
             engine_entry,
-            python_command: "python".to_string(),
+            python_command,
         })
     }
 
@@ -53,4 +55,18 @@ impl AppSettings {
             python_command: self.python_command.clone(),
         }
     }
+}
+
+fn resolve_python_command(workspace_dir: &PathBuf) -> String {
+    let venv_python = if cfg!(windows) {
+        workspace_dir.join(".venv").join("Scripts").join("python.exe")
+    } else {
+        workspace_dir.join(".venv").join("bin").join("python")
+    };
+
+    if venv_python.is_file() {
+        return venv_python.display().to_string();
+    }
+
+    "python".to_string()
 }
